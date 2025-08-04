@@ -1,3 +1,5 @@
+// index.js
+
 // server.js (With Authentication & Full API for Render)
 
 // --- DEPENDENCIES ---
@@ -31,73 +33,86 @@ const frontendUrl = process.env.FRONTEND_URL || 'https://nobiliscrochet.com';
 let stripeInstance, transporter, dbPool;
 function getStripe() { if (!stripeInstance) { stripeInstance = stripe(stripeSecretKey); } return stripeInstance; }
 function getTransporter() { if (!transporter) { transporter = nodemailer.createTransport({ service: 'gmail', auth: { user: emailUser, pass: emailPass } }); } return transporter; }
-function getDbPool() {
-    if (!dbPool) {
-        dbPool = new Pool({
-            connectionString: databaseUrl,
-            ssl: { rejectUnauthorized: false }
-        });
-    }
-    return dbPool;
-}
+function getDbPool() { if (!dbPool) { dbPool = new Pool({ connectionString: databaseUrl, ssl: { rejectUnauthorized: false } }); } return dbPool; }
 
 // --- MIDDLEWARE ---
-// Use `express.json()` before the webhook handler so the raw body is available there.
+app.use(cors({
+    origin: frontendUrl,
+    credentials: true
+}));
 app.use(express.json());
-app.use(cors({ origin: frontendUrl, credentials: true }));
 app.use(session({
-    store: new PgSession({ pool: getDbPool(), tableName: 'sessions' }),
+    store: new PgSession({ pool: getDbPool(), createTableIfMissing: true }),
     secret: sessionSecret,
     resave: false,
     saveUninitialized: false,
-    cookie: { secure: process.env.NODE_ENV === 'production', maxAge: 24 * 60 * 60 * 1000 }
+    cookie: { secure: true, httpOnly: true, sameSite: 'none', maxAge: 24 * 60 * 60 * 1000 }
 }));
 app.use(passport.initialize());
 app.use(passport.session());
 
-// --- AUTHENTICATION ---
+// --- PASSPORT (GOOGLE OAUTH) CONFIGURATION ---
 passport.use(new GoogleStrategy({
     clientID: googleClientId,
     clientSecret: googleClientSecret,
     callbackURL: `${serverUrl}/auth/google/callback`,
+    scope: ['profile', 'email']
 }, async (accessToken, refreshToken, profile, done) => {
+    const { id, displayName, emails } = profile;
+    const email = emails[0].value;
+    const db = getDbPool();
     try {
-        const db = getDbPool();
-        const user = {
-            id: profile.id,
-            display_name: profile.displayName,
-            email: profile.emails[0].value,
-        };
-        // Check if user exists
-        let result = await db.query('SELECT * FROM users WHERE id = $1', [user.id]);
-        if (result.rows.length === 0) {
-            // New user, insert into database
-            await db.query('INSERT INTO users (id, display_name, email) VALUES ($1, $2, $3)',
-                [user.id, user.display_name, user.email]);
+        let userResult = await db.query('SELECT * FROM users WHERE google_id = $1', [id]);
+        if (userResult.rows.length > 0) {
+            return done(null, userResult.rows[0]);
+        } else {
+            let newUserResult = await db.query(
+                'INSERT INTO users (google_id, display_name, email) VALUES ($1, $2, $3) RETURNING *',
+                [id, displayName, email]
+            );
+            return done(null, newUserResult.rows[0]);
         }
-        done(null, user);
-    } catch (error) {
-        done(error);
+    } catch (err) {
+        return done(err, null);
     }
 }));
-passport.serializeUser((user, done) => done(null, user.id));
+
+passport.serializeUser((user, done) => { done(null, user.id); });
 passport.deserializeUser(async (id, done) => {
+    const db = getDbPool();
     try {
-        const db = getDbPool();
         const result = await db.query('SELECT * FROM users WHERE id = $1', [id]);
         done(null, result.rows[0]);
-    } catch (error) {
-        done(error);
+    } catch (err) {
+        done(err, null);
     }
 });
-const ensureAuthenticated = (req, res, next) => {
+
+// --- AUTHENTICATION ROUTES ---
+app.get('/auth/google', passport.authenticate('google'));
+app.get('/auth/google/callback',
+    passport.authenticate('google', {
+        successRedirect: `${frontendUrl}/account.html`,
+        failureRedirect: `${frontendUrl}/login.html`
+    })
+);
+app.get('/auth/logout', (req, res, next) => {
+    req.logout(err => {
+        if (err) { return next(err); }
+        req.session.destroy(() => {
+            res.clearCookie('connect.sid');
+            res.redirect(`${frontendUrl}/index.html`);
+        });
+    });
+});
+
+// --- MIDDLEWARE TO PROTECT ROUTES ---
+function ensureAuthenticated(req, res, next) {
     if (req.isAuthenticated()) { return next(); }
-    res.status(401).json({ message: 'Authentication required' });
-};
+    res.status(401).json({ error: 'User not authenticated' });
+}
 
-// --- ROUTES ---
-
-// GET user info
+// --- API ROUTES ---
 app.get('/api/user', (req, res) => {
     if (req.isAuthenticated()) {
         res.json({ user: req.user });
@@ -106,10 +121,21 @@ app.get('/api/user', (req, res) => {
     }
 });
 
-// GET all reviews for a product
-app.get('/api/reviews/:productId', async (req, res) => {
+app.get('/api/orders', ensureAuthenticated, async (req, res) => {
     try {
-        const { productId } = req.params;
+        const db = getDbPool();
+        // This query now works because the `user_id` column will exist
+        const result = await db.query('SELECT * FROM orders WHERE user_id = $1 ORDER BY created_at DESC', [req.user.id]);
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Error fetching orders:', error);
+        res.status(500).json({ error: 'Failed to fetch orders' });
+    }
+});
+
+app.get('/api/reviews/:productId', async (req, res) => {
+    const { productId } = req.params;
+    try {
         const db = getDbPool();
         const result = await db.query('SELECT * FROM reviews WHERE product_id = $1 ORDER BY created_at DESC', [productId]);
         res.json(result.rows);
@@ -119,12 +145,10 @@ app.get('/api/reviews/:productId', async (req, res) => {
     }
 });
 
-// Post a new review
 app.post('/api/reviews', ensureAuthenticated, async (req, res) => {
     try {
         const { productId, rating, comment } = req.body;
         const { id: userId, display_name: userName } = req.user;
-        
         const db = getDbPool();
         const result = await db.query(
             'INSERT INTO reviews (product_id, user_id, user_name, rating, comment) VALUES ($1, $2, $3, $4, $5) RETURNING *',
@@ -139,121 +163,112 @@ app.post('/api/reviews', ensureAuthenticated, async (req, res) => {
 
 
 // --- STRIPE ROUTES ---
-
-// THIS IS THE ROUTE THAT WAS MISSING
-app.post('/create-checkout-session', async (req, res) => {
-    const stripe = getStripe();
-    const { cart } = req.body;
-    
-    // Convert cart items to Stripe line item format
-    const lineItems = cart.map(item => ({
-        price_data: {
-            currency: 'usd',
-            product_data: {
-                name: item.name,
-                images: [item.image]
-            },
-            unit_amount: Math.round(item.price * 100), // Stripe expects cents
-        },
-        quantity: item.quantity,
-    }));
-
+app.post('/api/create-checkout-session', ensureAuthenticated, async (req, res) => {
     try {
+        const { cart } = req.body;
+        const stripe = getStripe();
+
+        const line_items = cart.map(item => {
+            const priceInCents = Math.round(parseFloat(item.price.replace('$', '')) * 100);
+            return {
+                price_data: {
+                    currency: 'usd',
+                    product_data: {
+                        name: item.name,
+                        images: item.images.hasOwnProperty('head') ? [Object.values(item.images)[0]] : [item.images[0]],
+                    },
+                    unit_amount: priceInCents,
+                },
+                quantity: item.quantity,
+            };
+        });
+
         const session = await stripe.checkout.sessions.create({
             payment_method_types: ['card'],
-            line_items: lineItems,
+            line_items: line_items,
             mode: 'payment',
             success_url: `${frontendUrl}/success.html?session_id={CHECKOUT_SESSION_ID}`,
-            cancel_url: `${frontendUrl}/cancel.html`,
+            cancel_url: `${frontendUrl}/cart.html`,
+            // Pass the internal user ID to the webhook
+            metadata: {
+                userId: req.user.id 
+            },
+            // Collect customer email on the Stripe page
+            customer_email: req.user.email
         });
         res.json({ url: session.url });
     } catch (error) {
-        console.error('Error creating checkout session:', error);
+        console.error("Error creating Stripe session:", error);
         res.status(500).json({ error: 'Failed to create checkout session' });
     }
 });
 
-// A route to get order details for the account page.
-app.get('/order-details', async (req, res) => {
-    // Note: This route is for getting order history, not creating a session
-    const stripe = getStripe();
+app.get('/api/order-details', async (req, res) => {
+    const sessionId = req.query.session_id;
     try {
-        const { session_id } = req.query;
-        if (!session_id) {
-            return res.status(400).json({ error: 'Session ID is required.' });
-        }
-        
-        const session = await stripe.checkout.sessions.retrieve(session_id, {
-            expand: ['line_items'],
-        });
-
-        res.json({
-            id: session.id,
-            amount_total: session.amount_total / 100,
-            currency: session.currency,
-            line_items: session.line_items.data.map(item => ({
-                description: item.description,
-                quantity: item.quantity,
-                amount_total: item.amount_total / 100,
-            })),
-        });
+        const stripe = getStripe();
+        const session = await stripe.checkout.sessions.retrieve(sessionId, { expand: ['line_items'] });
+        res.json(session);
     } catch (error) {
-        console.error('Error fetching order details:', error);
-        res.status(500).json({ error: 'Failed to fetch order details.' });
+        console.error("Error fetching order details:", error);
+        res.status(500).json({ error: 'Failed to fetch order details' });
     }
 });
 
-
-// --- WEBHOOK ENDPOINT ---
+// This route should remain at the root as Stripe calls it directly
 app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-    const stripe = getStripe();
-    const payload = req.body;
     const sig = req.headers['stripe-signature'];
-    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
-
+    const stripe = getStripe();
     let event;
-
     try {
-        event = stripe.webhooks.constructEvent(payload, sig, webhookSecret);
+        event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
     } catch (err) {
-        console.error(`Webhook signature verification failed:`, err.message);
+        console.error(`Webhook signature verification failed.`, err.message);
         return res.sendStatus(400);
     }
 
-    // Handle the event
     if (event.type === 'checkout.session.completed') {
         const session = event.data.object;
-        console.log('Checkout Session completed:', session.id);
-
+        
         try {
-            // Here you would save the order to your database
+            const lineItems = await stripe.checkout.sessions.listLineItems(session.id);
             const db = getDbPool();
-            const result = await db.query(
-                'INSERT INTO orders (order_id, amount_total, customer_email, line_items) VALUES ($1, $2, $3, $4) RETURNING *',
-                [session.id, session.amount_total / 100, session.customer_email, JSON.stringify(session.line_items.data)]
-            );
-            console.log('Order saved to database:', result.rows[0].order_id);
+            
+            // UPDATED: This query now matches your 'orders' table schema exactly.
+            const queryText = `
+                INSERT INTO orders (
+                    order_id, 
+                    user_id, 
+                    customer_email, 
+                    amount_total, 
+                    shipping_details, 
+                    line_items, 
+                    status
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+            `;
+            
+            const values = [
+                session.id,
+                session.metadata.userId, // The user ID from your database
+                session.customer_details.email,
+                session.amount_total / 100, // Convert from cents to dollars
+                JSON.stringify(session.shipping_details),
+                JSON.stringify(lineItems.data),
+                session.payment_status
+            ];
 
-            // You can also send a confirmation email here
-            const transporter = getTransporter();
-            const mailOptions = {
-                from: emailUser,
-                to: emailRecipient, // Send to yourself
-                subject: 'New Order Received',
-                html: `<p>A new order has been placed. Order ID: ${session.id}</p><p>Customer email: ${session.customer_email}</p>`,
-            };
-            await transporter.sendMail(mailOptions);
-
-        } catch (error) {
-            console.error('Error processing webhook event:', error);
+            await db.query(queryText, values);
+            
+        } catch (dbError) {
+            console.error('Error saving order to database:', dbError);
         }
     }
-    
-    res.sendStatus(200);
+    res.json({ received: true });
 });
 
-// --- SERVER LISTENER ---
-const PORT = process.env.PORT || 3000;
+
+// --- SERVER START ---
+const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-    console.log(`Server is listening on port ${PORT}`);
+    console.log(`Server is running on port ${PORT}`);
 });
