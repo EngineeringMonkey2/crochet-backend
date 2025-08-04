@@ -61,6 +61,7 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
     const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
     let event;
     let session; // Declare session variable outside try/catch
+    let customer;
 
     try {
         event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
@@ -75,10 +76,11 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
         const checkoutSession = event.data.object;
         
         try {
-            // FIX: Retrieve the full session object with line items expanded
+            // FIX: Retrieve the full session object with line items and customer expanded
             session = await stripe.checkout.sessions.retrieve(checkoutSession.id, {
-                expand: ['line_items'],
+                expand: ['line_items', 'customer'],
             });
+            customer = session.customer;
 
             console.log('Checkout Session completed:', session.id);
 
@@ -86,7 +88,8 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
             const db = getDbPool();
             const result = await db.query(
                 'INSERT INTO orders (order_id, amount_total, customer_email, line_items) VALUES ($1, $2, $3, $4) RETURNING *',
-                [session.id, session.amount_total / 100, session.customer_email, JSON.stringify(session.line_items.data)]
+                // FIX: Use customer.email to ensure the email is not null
+                [session.id, session.amount_total / 100, customer.email, JSON.stringify(session.line_items.data)]
             );
             console.log('Order saved to database:', result.rows[0].order_id);
 
@@ -97,15 +100,15 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
             const lineItemsHtml = session.line_items.data.map(item => 
                 `<li>${item.quantity} x ${item.description} - $${(item.amount_total / 100).toFixed(2)}</li>`
             ).join('');
-
+            
+            // FIX: Use customer.email and customer.name for the customer email options
             const customerMailOptions = {
                 from: emailUser,
-                to: session.customer_email,
+                to: customer.email,
                 subject: 'Order Confirmation from Nobilis Crochet',
-                // FIX: Check if shipping_details exists before accessing .name
                 html: `
                     <h1>Thank You for Your Order!</h1>
-                    <p>Hi ${session.shipping_details ? session.shipping_details.name : 'Customer'},</p>
+                    <p>Hi ${customer.name || 'Customer'},</p>
                     <p>Your order #${session.id.slice(-8)} has been confirmed. We'll send you another email when it ships.</p>
                     <p><strong>Order Summary:</strong></p>
                     <ul>${lineItemsHtml}</ul>
@@ -119,7 +122,7 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
                 from: emailUser,
                 to: emailRecipient,
                 subject: 'New Order Received',
-                html: `<p>A new order has been placed. Order ID: ${session.id}</p><p>Customer email: ${session.customer_email}</p>`,
+                html: `<p>A new order has been placed. Order ID: ${session.id}</p><p>Customer email: ${customer.email}</p>`,
             };
 
             try {
