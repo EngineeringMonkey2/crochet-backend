@@ -76,8 +76,9 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
         const checkoutSession = event.data.object;
         
         try {
+            // FIX: Ensure we expand line_items.data.price.product to get product metadata
             session = await stripe.checkout.sessions.retrieve(checkoutSession.id, {
-                expand: ['line_items', 'customer'],
+                expand: ['line_items.data.price.product', 'customer'],
             });
             
             if (session.customer && typeof session.customer === 'object') {
@@ -103,13 +104,10 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
 
             // Function to generate HTML for a single line item, including custom details
             const formatLineItem = (item) => {
-                // Check if the item's description contains our special string for custom products
-                if (item.description && item.description.includes('Custom Details:')) {
-                    // Split the description to get the details part
-                    const descriptionParts = item.description.split('Custom Details:');
-                    const customDetailsString = descriptionParts[1];
-                    // Parse the JSON string back into an object
-                    const customDetails = JSON.parse(customDetailsString);
+                // FIX: Correctly check for metadata on the product object
+                const metadata = item.price && item.price.product ? item.price.product.metadata : {};
+                if (metadata.custom_details) {
+                    const customDetails = JSON.parse(metadata.custom_details);
                     
                     const customDetailsHtml = Object.entries(customDetails).map(([part, filename]) => 
                         `<li>${part}: ${filename}</li>`
@@ -117,7 +115,7 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
 
                     return `
                         <li>
-                            <b>Item:</b> ${descriptionParts[0].trim()} <br>
+                            <b>Item:</b> ${item.description} <br>
                             <b>Quantity:</b> ${item.quantity} <br>
                             <b>Price:</b> $${(item.amount_total / 100).toFixed(2)} <br>
                             <b>Custom Details:</b>
@@ -301,8 +299,13 @@ app.post('/create-checkout-session', async (req, res) => {
     
     // Convert cart items to Stripe line item format
     const lineItems = cart.map(item => {
-        let description = item.name;
-        // Check if the item is a custom monkey and has image data
+        // Prepare the product data
+        const productData = {
+            name: item.name,
+            images: item.image ? [item.image] : undefined
+        };
+        
+        // FIX: Ensure metadata is added to productData, keeping filename-only logic
         if (item.name === 'Custom Monkey' && item.images) {
             const shortImages = {};
             for (const part in item.images) {
@@ -311,15 +314,10 @@ app.post('/create-checkout-session', async (req, res) => {
             }
             // Add a custom string with the JSON data to the description
             // The webhook will use this to parse the details
-            description = `${item.name} Custom Details: ${JSON.stringify(shortImages)}`;
+            productData.metadata = {
+                custom_details: JSON.stringify(shortImages)
+            };
         }
-        
-        // Prepare the product data
-        const productData = {
-            name: item.name,
-            images: item.image ? [item.image] : undefined,
-            description: description // Use the new custom description
-        };
 
         return {
             price_data: {
