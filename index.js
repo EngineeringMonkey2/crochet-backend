@@ -57,15 +57,14 @@ function getDbPool() {
 // to ensure the raw body is available for signature verification.
 app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
     const stripe = getStripe();
-    const payload = req.body;
     const sig = req.headers['stripe-signature'];
     const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
-
     let event;
+    let session; // Declare session variable outside try/catch
 
     try {
-        event = stripe.webhooks.constructEvent(payload, sig, webhookSecret);
-        console.log('Webhook received:', event.type); // NEW: Log the event type
+        event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+        console.log('Webhook received:', event.type);
     } catch (err) {
         console.error(`Webhook signature verification failed:`, err.message);
         return res.sendStatus(400);
@@ -73,10 +72,16 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
 
     // Handle the event
     if (event.type === 'checkout.session.completed') {
-        const session = event.data.object;
-        console.log('Checkout Session completed:', session.id);
-
+        const checkoutSession = event.data.object;
+        
         try {
+            // FIX: Retrieve the full session object with line items expanded
+            session = await stripe.checkout.sessions.retrieve(checkoutSession.id, {
+                expand: ['line_items'],
+            });
+
+            console.log('Checkout Session completed:', session.id);
+
             // First, save the order to the database
             const db = getDbPool();
             const result = await db.query(
@@ -97,9 +102,10 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
                 from: emailUser,
                 to: session.customer_email,
                 subject: 'Order Confirmation from Nobilis Crochet',
+                // FIX: Check if shipping_details exists before accessing .name
                 html: `
                     <h1>Thank You for Your Order!</h1>
-                    <p>Hi ${session.shipping_details.name},</p>
+                    <p>Hi ${session.shipping_details ? session.shipping_details.name : 'Customer'},</p>
                     <p>Your order #${session.id.slice(-8)} has been confirmed. We'll send you another email when it ships.</p>
                     <p><strong>Order Summary:</strong></p>
                     <ul>${lineItemsHtml}</ul>
