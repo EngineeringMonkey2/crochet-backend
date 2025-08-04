@@ -100,10 +100,31 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
 
             // Now, handle email sending with specific error logging
             const transporter = getTransporter();
+            
+            // NEW: Create a function to format custom details
+            const formatCustomDetails = (metadata) => {
+                if (!metadata || !metadata.custom_details) {
+                    return '';
+                }
+                const customDetails = JSON.parse(metadata.custom_details);
+                let detailsHtml = '<h4>Custom Details:</h4><ul>';
+                for (const part in customDetails) {
+                    const formattedPart = part.replace(/-/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+                    detailsHtml += `<li><b>${formattedPart}:</b> ${customDetails[part].split('/').pop().split('?')[0]}</li>`;
+                }
+                detailsHtml += '</ul>';
+                return detailsHtml;
+            };
 
-            const lineItemsHtml = session.line_items.data.map(item => 
-                `<li>${item.quantity} x ${item.description} - $${(item.amount_total / 100).toFixed(2)}</li>`
-            ).join('');
+            const lineItemsHtml = session.line_items.data.map(item => {
+                const itemDetailsHtml = formatCustomDetails(item.price.product.metadata);
+                return `
+                    <li>
+                        ${item.quantity} x ${item.description} - $${(item.amount_total / 100).toFixed(2)}
+                        ${itemDetailsHtml}
+                    </li>
+                `;
+            }).join('');
             
             const customerMailOptions = {
                 from: emailUser,
@@ -121,7 +142,6 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
                 `,
             };
 
-            // FIX: Updated the email template for the store owner
             const ownerMailOptions = {
                 from: emailUser,
                 to: emailRecipient,
@@ -270,31 +290,48 @@ app.post('/create-checkout-session', async (req, res) => {
     const stripe = getStripe();
     const { cart } = req.body;
     
-    // Convert cart items to Stripe line item format
+    // NEW: Attach metadata to the product_data object when creating the session
     const lineItems = cart.map(item => ({
         price_data: {
             currency: 'usd',
             product_data: {
                 name: item.name,
-                images: [item.image]
+                images: item.images ? [item.images.head] : [item.image],
+                metadata: item.images ? { custom_details: JSON.stringify(item.images) } : {}
             },
-            unit_amount: Math.round(parseFloat(item.price.replace('$', '')) * 100), // Stripe expects cents
+            unit_amount: item.price,
         },
         quantity: item.quantity,
     }));
+    
+    // FIX: The front-end now sends the price in cents directly, so we no longer need to parse it here.
+    // The previous parsing logic caused a bug with regular non-custom items.
+    const finalLineItems = cart.map(item => {
+        const metadata = item.images ? { custom_details: JSON.stringify(item.images) } : {};
+        const image = item.images ? item.images.head : item.image;
+        
+        return {
+            price_data: {
+                currency: 'usd',
+                product_data: {
+                    name: item.name,
+                    images: [image],
+                    metadata: metadata
+                },
+                unit_amount: Math.round(parseFloat(item.price.replace('$', '')) * 100),
+            },
+            quantity: item.quantity,
+        };
+    });
 
     try {
         const session = await stripe.checkout.sessions.create({
             payment_method_types: ['card'],
-            line_items: lineItems,
+            line_items: finalLineItems,
             mode: 'payment',
             success_url: `${frontendUrl}/receipt.html?session_id={CHECKOUT_SESSION_ID}`,
             cancel_url: `${frontendUrl}/cancel.html`,
-            
-            // NEW: Enforce shipping address collection
             shipping_address_collection: {
-                // You can add more countries here as needed
-                // For example: allowed_countries: ['US', 'CA', 'GB']
                 allowed_countries: ['US'],
             },
         });
