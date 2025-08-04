@@ -30,7 +30,18 @@ const frontendUrl = process.env.FRONTEND_URL || 'https://nobiliscrochet.com';
 // --- LAZY INITIALIZATION & DB POOL ---
 let stripeInstance, transporter, dbPool;
 function getStripe() { if (!stripeInstance) { stripeInstance = stripe(stripeSecretKey); } return stripeInstance; }
-function getTransporter() { if (!transporter) { transporter = nodemailer.createTransport({ service: 'gmail', auth: { user: emailUser, pass: emailPass } }); } return transporter; }
+function getTransporter() { 
+    if (!transporter) {
+        // Log a message to ensure the transporter is being created
+        console.log("Attempting to create email transporter...");
+        transporter = nodemailer.createTransport({ 
+            service: 'gmail', 
+            auth: { user: emailUser, pass: emailPass } 
+        });
+        console.log("Email transporter created.");
+    }
+    return transporter; 
+}
 function getDbPool() {
     if (!dbPool) {
         dbPool = new Pool({
@@ -171,23 +182,6 @@ app.post('/create-checkout-session', async (req, res) => {
                 // For example: allowed_countries: ['US', 'CA', 'GB']
                 allowed_countries: ['US'],
             },
-            // NEW: Add shipping options. This is required when collecting a shipping address.
-            shipping_options: [
-                {
-                    shipping_rate_data: {
-                        type: 'fixed_amount',
-                        fixed_amount: {
-                            amount: 500, // $5.00 for shipping in cents
-                            currency: 'usd',
-                        },
-                        display_name: 'Standard Shipping',
-                        delivery_estimate: {
-                            minimum: { unit: 'business_day', value: 5 },
-                            maximum: { unit: 'business_day', value: 7 },
-                        },
-                    },
-                },
-            ],
         });
         res.json({ url: session.url });
     } catch (error) {
@@ -261,7 +255,7 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
         console.log('Checkout Session completed:', session.id);
 
         try {
-            // Here you would save the order to your database
+            // First, save the order to the database
             const db = getDbPool();
             const result = await db.query(
                 'INSERT INTO orders (order_id, amount_total, customer_email, line_items) VALUES ($1, $2, $3, $4) RETURNING *',
@@ -269,12 +263,14 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
             );
             console.log('Order saved to database:', result.rows[0].order_id);
 
+            // Now, handle email sending with specific error logging
+            const transporter = getTransporter();
+
             // Create a formatted list of line items for the email
             const lineItemsHtml = session.line_items.data.map(item => 
                 `<li>${item.quantity} x ${item.description} - $${(item.amount_total / 100).toFixed(2)}</li>`
             ).join('');
 
-            // NEW: Send a confirmation email to the customer
             const customerMailOptions = {
                 from: emailUser,
                 to: session.customer_email,
@@ -291,21 +287,29 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
                 `,
             };
 
-            // Existing email to the store owner
             const ownerMailOptions = {
                 from: emailUser,
-                to: emailRecipient, // Send to yourself
+                to: emailRecipient,
                 subject: 'New Order Received',
                 html: `<p>A new order has been placed. Order ID: ${session.id}</p><p>Customer email: ${session.customer_email}</p>`,
             };
 
-            const transporter = getTransporter();
-            await transporter.sendMail(customerMailOptions);
-            await transporter.sendMail(ownerMailOptions);
+            try {
+                await transporter.sendMail(customerMailOptions);
+                console.log('Confirmation email sent to customer.');
+            } catch (emailError) {
+                console.error('Error sending confirmation email to customer:', emailError);
+            }
 
+            try {
+                await transporter.sendMail(ownerMailOptions);
+                console.log('Order notification email sent to owner.');
+            } catch (emailError) {
+                console.error('Error sending order notification email to owner:', emailError);
+            }
 
         } catch (error) {
-            console.error('Error processing webhook event:', error);
+            console.error('Error processing webhook event (database/email):', error);
         }
     }
     
