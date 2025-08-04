@@ -101,44 +101,36 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
             // Now, handle email sending with specific error logging
             const transporter = getTransporter();
 
-            // Generate line items HTML for customer email
-            const lineItemsHtml = session.line_items.data.map(item => 
-                `<li>${item.quantity} x ${item.description} - $${(item.amount_total / 100).toFixed(2)}</li>`
-            ).join('');
-            
-            // Generate detailed line items HTML for owner email
-            let ownerLineItemsHtml = '';
-            for (const item of session.line_items.data) {
-                let itemHtml = `<div style="border: 1px solid #ddd; padding: 15px; margin-bottom: 15px; border-radius: 5px;">`;
-                itemHtml += `<h4 style="margin-top: 0;">${item.quantity} x ${item.description} - $${(item.amount_total / 100).toFixed(2)}</h4>`;
-                
-                // Check if this is a custom monkey by checking metadata
-                if (item.price && item.price.product && item.price.product.metadata) {
-                    const metadata = item.price.product.metadata;
-                    
-                    // Check if this is a custom monkey (has custom parts in metadata)
-                    if (metadata.head || metadata.body || metadata.tail) {
-                        itemHtml += `<p><strong>Custom Details:</strong></p>`;
-                        itemHtml += `<ul style="list-style-type: none; padding-left: 20px;">`;
-                        
-                        // List all custom parts
-                        const parts = ['head', 'left-ear', 'right-ear', 'body', 'left-arm', 'right-arm', 'legs', 'tail'];
-                        for (const part of parts) {
-                            if (metadata[part]) {
-                                // Extract just the filename from the URL
-                                const filename = metadata[part].split('/').pop();
-                                itemHtml += `<li><strong>${part}:</strong> ${filename}</li>`;
-                            }
-                        }
-                        
-                        itemHtml += `</ul>`;
-                    }
+            // Function to generate HTML for a single line item, including custom details
+            const formatLineItem = (item) => {
+                // FIX: Check if the item has our custom monkey metadata attached directly to the line item
+                if (item.metadata && item.metadata.custom_details) {
+                    const customDetails = JSON.parse(item.metadata.custom_details);
+                    const customDetailsHtml = Object.entries(customDetails).map(([part, filename]) => 
+                        // The metadata is already a filename string, so no need to split.
+                        `<li>${part}: ${filename}</li>`
+                    ).join('');
+
+                    return `
+                        <li>
+                            <b>Item:</b> ${item.description} <br>
+                            <b>Quantity:</b> ${item.quantity} <br>
+                            <b>Price:</b> $${(item.amount_total / 100).toFixed(2)} <br>
+                            <b>Custom Details:</b>
+                            <ul>
+                                ${customDetailsHtml}
+                            </ul>
+                        </li>
+                    `;
+                } else {
+                    // For a regular product, just return the standard list item
+                    return `<li>${item.quantity} x ${item.description} - $${(item.amount_total / 100).toFixed(2)}</li>`;
                 }
-                
-                itemHtml += `</div>`;
-                ownerLineItemsHtml += itemHtml;
-            }
+            };
             
+            // Map all line items to a formatted HTML string
+            const lineItemsHtml = session.line_items.data.map(formatLineItem).join('');
+
             const customerMailOptions = {
                 from: emailUser,
                 to: customer.email,
@@ -155,7 +147,7 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
                 `,
             };
 
-            // Updated email template for the store owner with custom details
+            // FIX: Updated the email template for the store owner with detailed custom product information
             const ownerMailOptions = {
                 from: emailUser,
                 to: emailRecipient,
@@ -167,7 +159,7 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
                     <p><b>Customer Email:</b> ${customer.email || 'N/A'}</p>
                     <hr>
                     <h3>Order Details:</h3>
-                    ${ownerLineItemsHtml}
+                    <ul>${lineItemsHtml}</ul>
                     <p><b>Total:</b> $${(session.amount_total / 100).toFixed(2)}</p>
                     <hr>
                     <h3>Shipping Address:</h3>
@@ -306,33 +298,34 @@ app.post('/create-checkout-session', async (req, res) => {
     
     // Convert cart items to Stripe line item format
     const lineItems = cart.map(item => {
-        const lineItem = {
+        // Prepare the product data, including metadata for custom items
+        const productData = {
+            name: item.name,
+            images: item.image ? [item.image] : undefined // Handle cases where a single image URL might not be present
+        };
+        
+        // If it's a custom monkey, add the image filenames to metadata
+        const metadata = {};
+        if (item.name === 'Custom Monkey' && item.images) {
+            const shortImages = {};
+            for (const part in item.images) {
+                // Extract only the filename from the full URL to stay within Stripe's metadata character limit
+                shortImages[part] = item.images[part].split('/').pop();
+            }
+            // The metadata value must be a string, so we use JSON.stringify()
+            metadata.custom_details = JSON.stringify(shortImages);
+        }
+
+        return {
             price_data: {
                 currency: 'usd',
-                product_data: {
-                    name: item.name,
-                    images: item.image ? [item.image] : [],
-                    // Add custom monkey parts to metadata if this is a custom monkey
-                    metadata: {}
-                },
+                product_data: productData,
                 unit_amount: Math.round(parseFloat(item.price.replace('$', '')) * 100), // Stripe expects cents
             },
             quantity: item.quantity,
+            // FIX: Add the metadata directly to the line item object
+            metadata: metadata
         };
-        
-        // If this is a custom monkey (has images object), add the parts to metadata
-        if (item.images && item.name === 'Custom Monkey') {
-            // Add each custom part to the metadata
-            const parts = ['head', 'left-ear', 'right-ear', 'body', 'left-arm', 'right-arm', 'legs', 'tail'];
-            for (const part of parts) {
-                if (item.images[part]) {
-                    // Stripe metadata keys must be less than 40 characters and values less than 500 characters
-                    lineItem.price_data.product_data.metadata[part] = item.images[part];
-                }
-            }
-        }
-        
-        return lineItem;
     });
 
     try {
