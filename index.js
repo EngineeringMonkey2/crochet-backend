@@ -1,3 +1,6 @@
+// server.js (With Authentication & Full API for Render)
+
+// --- DEPENDENCIES ---
 const express = require('express');
 const cors = require('cors');
 const nodemailer = require('nodemailer');
@@ -8,6 +11,7 @@ const GoogleStrategy = require('passport-google-oauth20').Strategy;
 const session = require('express-session');
 const PgSession = require('connect-pg-simple')(session);
 
+// --- INITIALIZATION ---
 const app = express();
 
 // --- ENVIRONMENT VARIABLES ---
@@ -15,7 +19,7 @@ const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
 const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
 const emailUser = process.env.EMAIL_USER;
 const emailPass = process.env.EMAIL_PASS;
-const emailRecipient = process.env.EMAIL_RECIPIENT;
+const emailRecipient = process.env.EMAIL_RECIPIENT; // This should be your email address
 const databaseUrl = process.env.DATABASE_URL;
 const googleClientId = process.env.GOOGLE_CLIENT_ID;
 const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET;
@@ -25,14 +29,10 @@ const frontendUrl = process.env.FRONTEND_URL || 'https://nobiliscrochet.com';
 
 // --- LAZY INITIALIZATION & DB POOL ---
 let stripeInstance, transporter, dbPool;
-function getStripe() { 
-    if (!stripeInstance) { 
-        stripeInstance = stripe(stripeSecretKey); 
-    } 
-    return stripeInstance; 
-}
+function getStripe() { if (!stripeInstance) { stripeInstance = stripe(stripeSecretKey); } return stripeInstance; }
 function getTransporter() { 
     if (!transporter) {
+        // Log a message to ensure the transporter is being created
         console.log("Attempting to create email transporter...");
         transporter = nodemailer.createTransport({ 
             service: 'gmail', 
@@ -52,14 +52,17 @@ function getDbPool() {
     return dbPool;
 }
 
-// --- MIDDLEWARE ---
+// FIX: CORS middleware is now configured and placed at the very top of the middleware stack
 app.use(cors({ origin: frontendUrl, credentials: true }));
-app.use(express.json());
+app.use(express.json()); // This is global for all other routes
 
-// --- WEBHOOK ROUTE ---
+// --- MIDDLEWARE ---
+// The webhook endpoint must be defined BEFORE the global `express.json()` middleware
+// to ensure the raw body is available for signature verification.
 app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
     const stripe = getStripe();
     const sig = req.headers['stripe-signature'];
+    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
     let event;
     let session;
     let customer;
@@ -72,6 +75,7 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
         return res.sendStatus(400);
     }
 
+    // Handle the event
     if (event.type === 'checkout.session.completed') {
         const checkoutSession = event.data.object;
         
@@ -90,6 +94,7 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
             
             console.log('Checkout Session completed:', session.id);
 
+            // First, save the order to the database
             const db = getDbPool();
             const result = await db.query(
                 'INSERT INTO orders (order_id, amount_total, customer_email, line_items) VALUES ($1, $2, $3, $4) RETURNING *',
@@ -97,6 +102,7 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
             );
             console.log('Order saved to database:', result.rows[0].order_id);
 
+            // Now, handle email sending with specific error logging
             const transporter = getTransporter();
             
             const formatCustomDetails = (metadata) => {
@@ -117,6 +123,7 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
                 return detailsHtml;
             };
             
+
             const lineItemsHtml = session.line_items.data.map(item => {
                 const itemDetailsHtml = formatCustomDetails(item.price.product.metadata);
                 return `
@@ -189,7 +196,6 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
     res.sendStatus(200);
 });
 
-// --- SESSION & AUTHENTICATION ---
 app.use(session({
     store: new PgSession({ pool: getDbPool(), tableName: 'sessions' }),
     secret: sessionSecret,
@@ -200,6 +206,7 @@ app.use(session({
 app.use(passport.initialize());
 app.use(passport.session());
 
+// --- AUTHENTICATION ---
 passport.use(new GoogleStrategy({
     clientID: googleClientId,
     clientSecret: googleClientSecret,
@@ -212,8 +219,10 @@ passport.use(new GoogleStrategy({
             display_name: profile.displayName,
             email: profile.emails[0].value,
         };
+        // Check if user exists
         let result = await db.query('SELECT * FROM users WHERE id = $1', [user.id]);
         if (result.rows.length === 0) {
+            // New user, insert into database
             await db.query('INSERT INTO users (id, display_name, email) VALUES ($1, $2, $3)',
                 [user.id, user.display_name, user.email]);
         }
@@ -238,6 +247,8 @@ const ensureAuthenticated = (req, res, next) => {
 };
 
 // --- ROUTES ---
+
+// GET user info
 app.get('/api/user', (req, res) => {
     if (req.isAuthenticated()) {
         res.json({ user: req.user });
@@ -246,6 +257,7 @@ app.get('/api/user', (req, res) => {
     }
 });
 
+// GET all reviews for a product
 app.get('/api/reviews/:productId', async (req, res) => {
     try {
         const { productId } = req.params;
@@ -258,6 +270,7 @@ app.get('/api/reviews/:productId', async (req, res) => {
     }
 });
 
+// Post a new review
 app.post('/api/reviews', ensureAuthenticated, async (req, res) => {
     try {
         const { productId, rating, comment } = req.body;
@@ -275,60 +288,63 @@ app.post('/api/reviews', ensureAuthenticated, async (req, res) => {
     }
 });
 
+
+// --- STRIPE ROUTES ---
+
 app.post('/create-checkout-session', async (req, res) => {
     const stripe = getStripe();
     const { cart } = req.body;
     
+    // FIX: Ensure cart is an array and not empty before mapping
     if (!Array.isArray(cart) || cart.length === 0) {
         console.error("Error creating checkout session: Cart is empty or invalid.");
         return res.status(400).json({ error: 'Cart is empty or invalid.' });
     }
+    
+    const finalLineItems = cart.map(item => {
+        // FIX: Add robust price parsing to handle different formats and prevent errors
+        let priceValue;
+        if (item.price && typeof item.price === 'string') {
+            const sanitizedPrice = item.price.replace(/[$,]/g, '');
+            priceValue = Math.round(parseFloat(sanitizedPrice) * 100);
+        } else if (typeof item.price === 'number') {
+            priceValue = Math.round(item.price * 100);
+        } else {
+            console.error(`Error: Invalid price for item "${item.name || 'Unknown Item'}". Price received:`, item.price);
+            return null; // Return null for invalid items
+        }
+
+        if (isNaN(priceValue)) {
+            console.error(`Error: Could not parse price for item "${item.name || 'Unknown Item'}". Price received:`, item.price);
+            return null;
+        }
+
+        const metadata = item.images ? { custom_details: JSON.stringify(item.images) } : {};
+        const image = item.images ? item.images.head : item.image;
+        
+        return {
+            price_data: {
+                currency: 'usd',
+                product_data: {
+                    name: item.name,
+                    images: [image],
+                    metadata: metadata
+                },
+                unit_amount: priceValue,
+            },
+            quantity: item.quantity,
+        };
+    }).filter(item => item !== null); // Filter out any items that failed validation
+
+    if (finalLineItems.length === 0) {
+        console.error("Error creating checkout session: All cart items failed validation.");
+        return res.status(400).json({ error: 'All cart items failed validation.' });
+    }
 
     try {
-        const lineItems = cart.map(item => {
-            const priceString = item.price && typeof item.price === 'string' ? item.price : '$0.00';
-            const unitAmount = Math.round(parseFloat(priceString.replace('$', '')) * 100);
-            
-            if (unitAmount <= 0) {
-                throw new Error(`Invalid price for item ${item.name || 'Unknown'}: ${priceString}`);
-            }
-
-            // Determine the main image for the product
-            let mainImage = '';
-            if (item.images) {
-                if (Array.isArray(item.images)) {
-                    // Predefined product: use the first image from the array
-                    mainImage = item.images[0] || item.image || '';
-                } else if (typeof item.images === 'object') {
-                    // Custom product: use images.head or item.image
-                    mainImage = item.images.head || item.image || '';
-                }
-            } else {
-                mainImage = item.image || '';
-            }
-
-            // Metadata for custom products
-            const metadata = item.images && typeof item.images === 'object' 
-                ? { custom_details: JSON.stringify(item.images) } 
-                : {};
-
-            return {
-                price_data: {
-                    currency: 'usd',
-                    product_data: {
-                        name: item.name || 'Custom Product',
-                        images: mainImage ? [mainImage] : [],
-                        metadata: metadata
-                    },
-                    unit_amount: unitAmount,
-                },
-                quantity: item.quantity || 1,
-            };
-        });
-
         const session = await stripe.checkout.sessions.create({
             payment_method_types: ['card'],
-            line_items: lineItems,
+            line_items: finalLineItems,
             mode: 'payment',
             success_url: `${frontendUrl}/receipt.html?session_id={CHECKOUT_SESSION_ID}`,
             cancel_url: `${frontendUrl}/cancel.html`,
@@ -336,14 +352,14 @@ app.post('/create-checkout-session', async (req, res) => {
                 allowed_countries: ['US'],
             },
         });
-
         res.json({ url: session.url });
     } catch (error) {
-        console.error('Error creating checkout session:', error.message);
-        res.status(500).json({ error: `Failed to create checkout session: ${error.message}` });
+        console.error('Error creating checkout session:', error);
+        res.status(500).json({ error: 'Failed to create checkout session' });
     }
 });
 
+// A route to get order details for the account page.
 app.get('/order-details', async (req, res) => {
     const stripe = getStripe();
     try {
@@ -379,6 +395,7 @@ app.get('/order-details', async (req, res) => {
         res.status(500).json({ error: 'Failed to fetch order details.' });
     }
 });
+
 
 // --- SERVER LISTENER ---
 const PORT = process.env.PORT || 3000;
