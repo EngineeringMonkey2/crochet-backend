@@ -52,6 +52,9 @@ function getDbPool() {
     return dbPool;
 }
 
+// FIX: CORS middleware is now configured and placed at the very top of the middleware stack
+app.use(cors({ origin: frontendUrl, credentials: true }));
+
 // --- MIDDLEWARE ---
 // The webhook endpoint must be defined BEFORE the global `express.json()` middleware
 // to ensure the raw body is available for signature verification.
@@ -195,8 +198,6 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
 // This global middleware should come AFTER the webhook route
 app.use(express.json());
 
-// FIX: CORS middleware is now configured to specifically allow your frontend URL.
-app.use(cors({ origin: frontendUrl, credentials: true }));
 app.use(session({
     store: new PgSession({ pool: getDbPool(), tableName: 'sessions' }),
     secret: sessionSecret,
