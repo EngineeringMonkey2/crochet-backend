@@ -76,18 +76,15 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
         const checkoutSession = event.data.object;
         
         try {
-            // FIX: Retrieve the full session object with line items and customer expanded
             session = await stripe.checkout.sessions.retrieve(checkoutSession.id, {
                 expand: ['line_items', 'customer'],
             });
             
-            // FIX: Check if the customer object is expanded, otherwise retrieve it separately.
             if (session.customer && typeof session.customer === 'object') {
                 customer = session.customer;
             } else if (session.customer) {
                 customer = await stripe.customers.retrieve(session.customer);
             } else {
-                // If there is no customer ID, use the email from the session object
                 customer = { email: checkoutSession.customer_details.email, name: checkoutSession.customer_details.name || 'Customer' };
             }
             
@@ -97,7 +94,6 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
             const db = getDbPool();
             const result = await db.query(
                 'INSERT INTO orders (order_id, amount_total, customer_email, line_items) VALUES ($1, $2, $3, $4) RETURNING *',
-                // FIX: Use customer.email to ensure the email is not null
                 [session.id, session.amount_total / 100, customer.email, JSON.stringify(session.line_items.data)]
             );
             console.log('Order saved to database:', result.rows[0].order_id);
@@ -105,7 +101,6 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
             // Now, handle email sending with specific error logging
             const transporter = getTransporter();
 
-            // Create a formatted list of line items for the email
             const lineItemsHtml = session.line_items.data.map(item => 
                 `<li>${item.quantity} x ${item.description} - $${(item.amount_total / 100).toFixed(2)}</li>`
             ).join('');
@@ -126,11 +121,29 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
                 `,
             };
 
+            // FIX: Updated the email template for the store owner
             const ownerMailOptions = {
                 from: emailUser,
                 to: emailRecipient,
-                subject: 'New Order Received',
-                html: `<p>A new order has been placed. Order ID: ${session.id}</p><p>Customer email: ${customer.email}</p>`,
+                subject: `NEW ORDER #${session.id.slice(-8)} from ${customer.name || 'Customer'}`,
+                html: `
+                    <h1>New Order Received!</h1>
+                    <p><b>Order ID:</b> ${session.id}</p>
+                    <p><b>Customer Name:</b> ${customer.name || 'N/A'}</p>
+                    <p><b>Customer Email:</b> ${customer.email || 'N/A'}</p>
+                    <hr>
+                    <h3>Order Summary:</h3>
+                    <ul>${lineItemsHtml}</ul>
+                    <p><b>Total:</b> $${(session.amount_total / 100).toFixed(2)}</p>
+                    <hr>
+                    <h3>Shipping Address:</h3>
+                    <p>
+                        ${session.shipping_details ? session.shipping_details.name : 'N/A'}<br>
+                        ${session.shipping_details ? (session.shipping_details.address.line1 || 'N/A') : ''}${session.shipping_details && session.shipping_details.address.line2 ? '<br>' + session.shipping_details.address.line2 : ''}<br>
+                        ${session.shipping_details ? (session.shipping_details.address.city || 'N/A') : ''}, ${session.shipping_details ? (session.shipping_details.address.state || 'N/A') : ''} ${session.shipping_details ? (session.shipping_details.address.postal_code || 'N/A') : ''}<br>
+                        ${session.shipping_details ? (session.shipping_details.address.country || 'N/A') : ''}
+                    </p>
+                `,
             };
 
             try {
@@ -305,16 +318,11 @@ app.get('/order-details', async (req, res) => {
             expand: ['line_items'],
         });
 
-        // The data for shipping address is in the session object.
         const shippingDetails = session.shipping_details;
-
-        // The line items from Stripe contain a `price` object, which has `product.metadata`
-        // We'll extract and format this as needed.
         const formattedLineItems = session.line_items.data.map(item => ({
             description: item.description,
             quantity: item.quantity,
             amount_total: item.amount_total / 100,
-            // Check if metadata exists before accessing it
             metadata: item.price.product.metadata ? item.price.product.metadata : {},
         }));
         
