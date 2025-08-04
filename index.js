@@ -298,6 +298,9 @@ app.post('/create-checkout-session', async (req, res) => {
     const { cart } = req.body;
     
     const finalLineItems = cart.map(item => {
+        // FIX: Ensure item.price is a string before using .replace
+        const priceString = item.price && typeof item.price === 'string' ? item.price : '$0.00';
+        
         const metadata = item.images ? { custom_details: JSON.stringify(item.images) } : {};
         const image = item.images ? item.images.head : item.image;
         
@@ -309,7 +312,7 @@ app.post('/create-checkout-session', async (req, res) => {
                     images: [image],
                     metadata: metadata
                 },
-                unit_amount: Math.round(parseFloat(item.price.replace('$', '')) * 100),
+                unit_amount: Math.round(parseFloat(priceString.replace('$', '')) * 100),
             },
             quantity: item.quantity,
         };
