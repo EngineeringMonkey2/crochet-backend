@@ -77,7 +77,7 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
         
         try {
             session = await stripe.checkout.sessions.retrieve(checkoutSession.id, {
-                expand: ['line_items', 'line_items.data.price.product', 'customer'],
+                expand: ['line_items', 'customer'],
             });
             
             if (session.customer && typeof session.customer === 'object') {
@@ -101,65 +101,40 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
             // Now, handle email sending with specific error logging
             const transporter = getTransporter();
 
-            // Generate line items HTML for customer email
-            const lineItemsHtml = session.line_items.data.map(item => 
-                `<li>${item.quantity} x ${item.description} - $${(item.amount_total / 100).toFixed(2)}</li>`
-            ).join('');
-            
-            // Generate detailed line items HTML for owner email
-            let ownerLineItemsHtml = '';
-            for (const item of session.line_items.data) {
-                let itemHtml = `<div style="border: 1px solid #ddd; padding: 15px; margin-bottom: 15px; border-radius: 5px;">`;
-                itemHtml += `<h4 style="margin-top: 0;">${item.quantity} x ${item.description} - $${(item.amount_total / 100).toFixed(2)}</h4>`;
-                
-                // Check if this is a custom monkey by checking the product name and metadata
-                if (item.description === 'Custom Monkey' && item.price && item.price.product) {
-                    // First, try to get metadata from the expanded product
-                    let metadata = {};
+            // Function to generate HTML for a single line item, including custom details
+            const formatLineItem = (item) => {
+                // Check if the item's description contains our special string for custom products
+                if (item.description && item.description.includes('Custom Details:')) {
+                    // Split the description to get the details part
+                    const descriptionParts = item.description.split('Custom Details:');
+                    const customDetailsString = descriptionParts[1];
+                    // Parse the JSON string back into an object
+                    const customDetails = JSON.parse(customDetailsString);
                     
-                    // Retrieve the full product details to get metadata
-                    try {
-                        const product = await stripe.products.retrieve(item.price.product);
-                        metadata = product.metadata || {};
-                    } catch (error) {
-                        console.log('Could not retrieve product metadata:', error);
-                    }
-                    
-                    // Check if we have custom monkey metadata
-                    const hasCustomParts = metadata.head || metadata.body || metadata.tail || 
-                                         metadata.left_ear || metadata.right_ear || 
-                                         metadata.left_arm || metadata.right_arm || metadata.legs;
-                    
-                    if (hasCustomParts) {
-                        itemHtml += `<p><strong>Custom Details:</strong></p>`;
-                        itemHtml += `<ul style="list-style-type: none; padding-left: 20px;">`;
-                        
-                        // List all custom parts in a specific order
-                        const partMappings = {
-                            'head': 'Head',
-                            'left_ear': 'Left Ear',
-                            'right_ear': 'Right Ear', 
-                            'body': 'Body',
-                            'left_arm': 'Left Arm',
-                            'right_arm': 'Right Arm',
-                            'legs': 'Legs',
-                            'tail': 'Tail'
-                        };
-                        
-                        for (const [key, label] of Object.entries(partMappings)) {
-                            if (metadata[key]) {
-                                itemHtml += `<li><strong>${label}:</strong> ${metadata[key]}</li>`;
-                            }
-                        }
-                        
-                        itemHtml += `</ul>`;
-                    }
+                    const customDetailsHtml = Object.entries(customDetails).map(([part, filename]) => 
+                        `<li>${part}: ${filename}</li>`
+                    ).join('');
+
+                    return `
+                        <li>
+                            <b>Item:</b> ${descriptionParts[0].trim()} <br>
+                            <b>Quantity:</b> ${item.quantity} <br>
+                            <b>Price:</b> $${(item.amount_total / 100).toFixed(2)} <br>
+                            <b>Custom Details:</b>
+                            <ul>
+                                ${customDetailsHtml}
+                            </ul>
+                        </li>
+                    `;
+                } else {
+                    // For a regular product, just return the standard list item
+                    return `<li>${item.quantity} x ${item.description} - $${(item.amount_total / 100).toFixed(2)}</li>`;
                 }
-                
-                itemHtml += `</div>`;
-                ownerLineItemsHtml += itemHtml;
-            }
+            };
             
+            // Map all line items to a formatted HTML string
+            const lineItemsHtml = session.line_items.data.map(formatLineItem).join('');
+
             const customerMailOptions = {
                 from: emailUser,
                 to: customer.email,
@@ -176,7 +151,6 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
                 `,
             };
 
-            // Updated email template for the store owner with custom details
             const ownerMailOptions = {
                 from: emailUser,
                 to: emailRecipient,
@@ -188,7 +162,7 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
                     <p><b>Customer Email:</b> ${customer.email || 'N/A'}</p>
                     <hr>
                     <h3>Order Details:</h3>
-                    ${ownerLineItemsHtml}
+                    <ul>${lineItemsHtml}</ul>
                     <p><b>Total:</b> $${(session.amount_total / 100).toFixed(2)}</p>
                     <hr>
                     <h3>Shipping Address:</h3>
@@ -226,16 +200,8 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
 // This global middleware should come AFTER the webhook route
 app.use(express.json());
 app.use(cors({ origin: frontendUrl, credentials: true }));
-
-// Session configuration
-const sessionStore = new PgSession({ 
-    pool: getDbPool(), 
-    tableName: 'sessions',
-    createTableIfMissing: true // Add this to auto-create the sessions table
-});
-
 app.use(session({
-    store: sessionStore,
+    store: new PgSession({ pool: getDbPool(), tableName: 'sessions' }),
     secret: sessionSecret,
     resave: false,
     saveUninitialized: false,
@@ -335,37 +301,34 @@ app.post('/create-checkout-session', async (req, res) => {
     
     // Convert cart items to Stripe line item format
     const lineItems = cart.map(item => {
-        const lineItem = {
+        let description = item.name;
+        // Check if the item is a custom monkey and has image data
+        if (item.name === 'Custom Monkey' && item.images) {
+            const shortImages = {};
+            for (const part in item.images) {
+                // Extract only the filename from the full URL
+                shortImages[part] = item.images[part].split('/').pop();
+            }
+            // Add a custom string with the JSON data to the description
+            // The webhook will use this to parse the details
+            description = `${item.name} Custom Details: ${JSON.stringify(shortImages)}`;
+        }
+        
+        // Prepare the product data
+        const productData = {
+            name: item.name,
+            images: item.image ? [item.image] : undefined,
+            description: description // Use the new custom description
+        };
+
+        return {
             price_data: {
                 currency: 'usd',
-                product_data: {
-                    name: item.name,
-                    images: item.image ? [item.image] : []
-                },
+                product_data: productData,
                 unit_amount: Math.round(parseFloat(item.price.replace('$', '')) * 100), // Stripe expects cents
             },
             quantity: item.quantity,
         };
-        
-        // If this is a custom monkey (has images object), add the parts to metadata
-        if (item.images && item.name === 'Custom Monkey') {
-            // Initialize metadata object
-            lineItem.price_data.product_data.metadata = {};
-            
-            // Add each custom part to the metadata
-            const parts = ['head', 'left-ear', 'right-ear', 'body', 'left-arm', 'right-arm', 'legs', 'tail'];
-            for (const part of parts) {
-                if (item.images[part]) {
-                    // Stripe metadata keys must use underscores instead of hyphens
-                    const metadataKey = part.replace('-', '_');
-                    // Extract just the filename from the URL for brevity
-                    const filename = item.images[part].split('/').pop();
-                    lineItem.price_data.product_data.metadata[metadataKey] = filename;
-                }
-            }
-        }
-        
-        return lineItem;
     });
 
     try {
