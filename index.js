@@ -60,7 +60,7 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
     const sig = req.headers['stripe-signature'];
     const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
     let event;
-    let session; // Declare session variable outside try/catch
+    let session;
     let customer;
 
     try {
@@ -80,8 +80,17 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
             session = await stripe.checkout.sessions.retrieve(checkoutSession.id, {
                 expand: ['line_items', 'customer'],
             });
-            customer = session.customer;
-
+            
+            // FIX: Check if the customer object is expanded, otherwise retrieve it separately.
+            if (session.customer && typeof session.customer === 'object') {
+                customer = session.customer;
+            } else if (session.customer) {
+                customer = await stripe.customers.retrieve(session.customer);
+            } else {
+                // If there is no customer ID, use the email from the session object
+                customer = { email: checkoutSession.customer_details.email, name: checkoutSession.customer_details.name || 'Customer' };
+            }
+            
             console.log('Checkout Session completed:', session.id);
 
             // First, save the order to the database
@@ -101,7 +110,6 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
                 `<li>${item.quantity} x ${item.description} - $${(item.amount_total / 100).toFixed(2)}</li>`
             ).join('');
             
-            // FIX: Use customer.email and customer.name for the customer email options
             const customerMailOptions = {
                 from: emailUser,
                 to: customer.email,
