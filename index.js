@@ -19,7 +19,7 @@ const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
 const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
 const emailUser = process.env.EMAIL_USER;
 const emailPass = process.env.EMAIL_PASS;
-const emailRecipient = process.env.EMAIL_RECIPIENT;
+const emailRecipient = process.env.EMAIL_RECIPIENT; // This should be your email address
 const databaseUrl = process.env.DATABASE_URL;
 const googleClientId = process.env.GOOGLE_CLIENT_ID;
 const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET;
@@ -140,7 +140,6 @@ app.post('/api/reviews', ensureAuthenticated, async (req, res) => {
 
 // --- STRIPE ROUTES ---
 
-// THIS IS THE ROUTE THAT WAS MISSING
 app.post('/create-checkout-session', async (req, res) => {
     const stripe = getStripe();
     const { cart } = req.body;
@@ -153,7 +152,6 @@ app.post('/create-checkout-session', async (req, res) => {
                 name: item.name,
                 images: [item.image]
             },
-            // FIX: Convert item.price from a string to a number before calculating the unit_amount
             unit_amount: Math.round(parseFloat(item.price.replace('$', '')) * 100), // Stripe expects cents
         },
         quantity: item.quantity,
@@ -165,7 +163,31 @@ app.post('/create-checkout-session', async (req, res) => {
             line_items: lineItems,
             mode: 'payment',
             success_url: `${frontendUrl}/receipt.html?session_id={CHECKOUT_SESSION_ID}`,
-            cancel_url: `${frontendUrl}/cart.html`,
+            cancel_url: `${frontendUrl}/cancel.html`,
+            
+            // NEW: Enforce shipping address collection
+            shipping_address_collection: {
+                // You can add more countries here as needed
+                // For example: allowed_countries: ['US', 'CA', 'GB']
+                allowed_countries: ['US'],
+            },
+            // NEW: Add shipping options. This is required when collecting a shipping address.
+            shipping_options: [
+                {
+                    shipping_rate_data: {
+                        type: 'fixed_amount',
+                        fixed_amount: {
+                            amount: 500, // $5.00 for shipping in cents
+                            currency: 'usd',
+                        },
+                        display_name: 'Standard Shipping',
+                        delivery_estimate: {
+                            minimum: { unit: 'business_day', value: 5 },
+                            maximum: { unit: 'business_day', value: 7 },
+                        },
+                    },
+                },
+            ],
         });
         res.json({ url: session.url });
     } catch (error) {
@@ -176,7 +198,6 @@ app.post('/create-checkout-session', async (req, res) => {
 
 // A route to get order details for the account page.
 app.get('/order-details', async (req, res) => {
-    // Note: This route is for getting order history, not creating a session
     const stripe = getStripe();
     try {
         const { session_id } = req.query;
@@ -188,15 +209,28 @@ app.get('/order-details', async (req, res) => {
             expand: ['line_items'],
         });
 
+        // The data for shipping address is in the session object.
+        const shippingDetails = session.shipping_details;
+
+        // The line items from Stripe contain a `price` object, which has `product.metadata`
+        // We'll extract and format this as needed.
+        const formattedLineItems = session.line_items.data.map(item => ({
+            description: item.description,
+            quantity: item.quantity,
+            amount_total: item.amount_total / 100,
+            // Check if metadata exists before accessing it
+            metadata: item.price.product.metadata ? item.price.product.metadata : {},
+        }));
+        
         res.json({
             id: session.id,
             amount_total: session.amount_total / 100,
+            amount_subtotal: session.amount_subtotal / 100,
             currency: session.currency,
-            line_items: session.line_items.data.map(item => ({
-                description: item.description,
-                quantity: item.quantity,
-                amount_total: item.amount_total / 100,
-            })),
+            shipping_details: shippingDetails,
+            shipping_cost: session.shipping_cost,
+            total_details: session.total_details,
+            line_items: formattedLineItems,
         });
     } catch (error) {
         console.error('Error fetching order details:', error);
@@ -235,15 +269,40 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
             );
             console.log('Order saved to database:', result.rows[0].order_id);
 
-            // You can also send a confirmation email here
-            const transporter = getTransporter();
-            const mailOptions = {
+            // Create a formatted list of line items for the email
+            const lineItemsHtml = session.line_items.data.map(item => 
+                `<li>${item.quantity} x ${item.description} - $${(item.amount_total / 100).toFixed(2)}</li>`
+            ).join('');
+
+            // NEW: Send a confirmation email to the customer
+            const customerMailOptions = {
+                from: emailUser,
+                to: session.customer_email,
+                subject: 'Order Confirmation from Nobilis Crochet',
+                html: `
+                    <h1>Thank You for Your Order!</h1>
+                    <p>Hi ${session.shipping_details.name},</p>
+                    <p>Your order #${session.id.slice(-8)} has been confirmed. We'll send you another email when it ships.</p>
+                    <p><strong>Order Summary:</strong></p>
+                    <ul>${lineItemsHtml}</ul>
+                    <p>Total: $${(session.amount_total / 100).toFixed(2)}</p>
+                    <p>If you have any questions, please contact us.</p>
+                    <p>The Nobilis Crochet Team</p>
+                `,
+            };
+
+            // Existing email to the store owner
+            const ownerMailOptions = {
                 from: emailUser,
                 to: emailRecipient, // Send to yourself
                 subject: 'New Order Received',
                 html: `<p>A new order has been placed. Order ID: ${session.id}</p><p>Customer email: ${session.customer_email}</p>`,
             };
-            await transporter.sendMail(mailOptions);
+
+            const transporter = getTransporter();
+            await transporter.sendMail(customerMailOptions);
+            await transporter.sendMail(ownerMailOptions);
+
 
         } catch (error) {
             console.error('Error processing webhook event:', error);
