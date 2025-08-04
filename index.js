@@ -52,10 +52,6 @@ function getDbPool() {
     return dbPool;
 }
 
-// FIX: CORS middleware is now configured and placed at the very top of the middleware stack
-app.use(cors({ origin: frontendUrl, credentials: true }));
-app.use(express.json()); // This is global for all other routes
-
 // --- MIDDLEWARE ---
 // The webhook endpoint must be defined BEFORE the global `express.json()` middleware
 // to ensure the raw body is available for signature verification.
@@ -104,35 +100,10 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
 
             // Now, handle email sending with specific error logging
             const transporter = getTransporter();
-            
-            const formatCustomDetails = (metadata) => {
-                if (!metadata || !metadata.custom_details) {
-                    return '';
-                }
-                const customDetails = JSON.parse(metadata.custom_details);
-                let detailsHtml = '<h4>Custom Details:</h4><ul>';
-                for (const part in customDetails) {
-                    const formattedPart = part.replace(/-/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
-                    if (part.includes('eye') || part.includes('mouth')) {
-                         detailsHtml += `<li><b>${formattedPart}:</b> ${customDetails[part] === 'Static' ? 'Static' : 'Customized'}</li>`;
-                    } else {
-                        detailsHtml += `<li><b>${formattedPart}:</b> ${customDetails[part].split('/').pop().split('?')[0]}</li>`;
-                    }
-                }
-                detailsHtml += '</ul>';
-                return detailsHtml;
-            };
-            
 
-            const lineItemsHtml = session.line_items.data.map(item => {
-                const itemDetailsHtml = formatCustomDetails(item.price.product.metadata);
-                return `
-                    <li>
-                        ${item.quantity} x ${item.description} - $${(item.amount_total / 100).toFixed(2)}
-                        ${itemDetailsHtml}
-                    </li>
-                `;
-            }).join('');
+            const lineItemsHtml = session.line_items.data.map(item => 
+                `<li>${item.quantity} x ${item.description} - $${(item.amount_total / 100).toFixed(2)}</li>`
+            ).join('');
             
             const customerMailOptions = {
                 from: emailUser,
@@ -150,6 +121,7 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
                 `,
             };
 
+            // FIX: Updated the email template for the store owner
             const ownerMailOptions = {
                 from: emailUser,
                 to: emailRecipient,
@@ -196,6 +168,9 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
     res.sendStatus(200);
 });
 
+// This global middleware should come AFTER the webhook route
+app.use(express.json());
+app.use(cors({ origin: frontendUrl, credentials: true }));
 app.use(session({
     store: new PgSession({ pool: getDbPool(), tableName: 'sessions' }),
     secret: sessionSecret,
@@ -295,60 +270,31 @@ app.post('/create-checkout-session', async (req, res) => {
     const stripe = getStripe();
     const { cart } = req.body;
     
-    // FIX: Ensure cart is an array and not empty before mapping
-    if (!Array.isArray(cart) || cart.length === 0) {
-        console.error("Error creating checkout session: Cart is empty or invalid.");
-        return res.status(400).json({ error: 'Cart is empty or invalid.' });
-    }
-    
-    const finalLineItems = cart.map(item => {
-        // FIX: Add robust price parsing to handle different formats and prevent errors
-        let priceValue;
-        if (item.price && typeof item.price === 'string') {
-            const sanitizedPrice = item.price.replace(/[$,]/g, '');
-            priceValue = Math.round(parseFloat(sanitizedPrice) * 100);
-        } else if (typeof item.price === 'number') {
-            priceValue = Math.round(item.price * 100);
-        } else {
-            console.error(`Error: Invalid price for item "${item.name || 'Unknown Item'}". Price received:`, item.price);
-            return null; // Return null for invalid items
-        }
-
-        if (isNaN(priceValue)) {
-            console.error(`Error: Could not parse price for item "${item.name || 'Unknown Item'}". Price received:`, item.price);
-            return null;
-        }
-
-        const metadata = item.images ? { custom_details: JSON.stringify(item.images) } : {};
-        const image = item.images ? item.images.head : item.image;
-        
-        return {
-            price_data: {
-                currency: 'usd',
-                product_data: {
-                    name: item.name,
-                    images: [image],
-                    metadata: metadata
-                },
-                unit_amount: priceValue,
+    // Convert cart items to Stripe line item format
+    const lineItems = cart.map(item => ({
+        price_data: {
+            currency: 'usd',
+            product_data: {
+                name: item.name,
+                images: [item.image]
             },
-            quantity: item.quantity,
-        };
-    }).filter(item => item !== null); // Filter out any items that failed validation
-
-    if (finalLineItems.length === 0) {
-        console.error("Error creating checkout session: All cart items failed validation.");
-        return res.status(400).json({ error: 'All cart items failed validation.' });
-    }
+            unit_amount: Math.round(parseFloat(item.price.replace('$', '')) * 100), // Stripe expects cents
+        },
+        quantity: item.quantity,
+    }));
 
     try {
         const session = await stripe.checkout.sessions.create({
             payment_method_types: ['card'],
-            line_items: finalLineItems,
+            line_items: lineItems,
             mode: 'payment',
             success_url: `${frontendUrl}/receipt.html?session_id={CHECKOUT_SESSION_ID}`,
             cancel_url: `${frontendUrl}/cancel.html`,
+            
+            // NEW: Enforce shipping address collection
             shipping_address_collection: {
+                // You can add more countries here as needed
+                // For example: allowed_countries: ['US', 'CA', 'GB']
                 allowed_countries: ['US'],
             },
         });
@@ -402,3 +348,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`Server is listening on port ${PORT}`);
 });
+//this one is the working one
