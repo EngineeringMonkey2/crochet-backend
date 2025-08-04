@@ -76,10 +76,9 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
         const checkoutSession = event.data.object;
         
         try {
-            // FIX: Removed the expand line_items.data.price.product as it was causing an error.
-            // The product data is already available within the line item.
+            // FIX: Correctly expand the product details to get the metadata
             session = await stripe.checkout.sessions.retrieve(checkoutSession.id, {
-                expand: ['line_items', 'customer'],
+                expand: ['line_items.data.price.product', 'customer'],
             });
             
             if (session.customer && typeof session.customer === 'object') {
