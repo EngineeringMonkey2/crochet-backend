@@ -153,7 +153,8 @@ app.post('/create-checkout-session', async (req, res) => {
                 name: item.name,
                 images: [item.image]
             },
-            unit_amount: Math.round(item.price * 100), // Stripe expects cents
+            // FIX: Convert item.price from a string to a number before calculating the unit_amount
+            unit_amount: Math.round(parseFloat(item.price.replace('$', '')) * 100), // Stripe expects cents
         },
         quantity: item.quantity,
     }));
