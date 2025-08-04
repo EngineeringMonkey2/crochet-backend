@@ -53,7 +53,92 @@ function getDbPool() {
 }
 
 // --- MIDDLEWARE ---
-// Use `express.json()` before the webhook handler so the raw body is available there.
+// The webhook endpoint must be defined BEFORE the global `express.json()` middleware
+// to ensure the raw body is available for signature verification.
+app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+    const stripe = getStripe();
+    const payload = req.body;
+    const sig = req.headers['stripe-signature'];
+    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+    let event;
+
+    try {
+        event = stripe.webhooks.constructEvent(payload, sig, webhookSecret);
+        console.log('Webhook received:', event.type); // NEW: Log the event type
+    } catch (err) {
+        console.error(`Webhook signature verification failed:`, err.message);
+        return res.sendStatus(400);
+    }
+
+    // Handle the event
+    if (event.type === 'checkout.session.completed') {
+        const session = event.data.object;
+        console.log('Checkout Session completed:', session.id);
+
+        try {
+            // First, save the order to the database
+            const db = getDbPool();
+            const result = await db.query(
+                'INSERT INTO orders (order_id, amount_total, customer_email, line_items) VALUES ($1, $2, $3, $4) RETURNING *',
+                [session.id, session.amount_total / 100, session.customer_email, JSON.stringify(session.line_items.data)]
+            );
+            console.log('Order saved to database:', result.rows[0].order_id);
+
+            // Now, handle email sending with specific error logging
+            const transporter = getTransporter();
+
+            // Create a formatted list of line items for the email
+            const lineItemsHtml = session.line_items.data.map(item => 
+                `<li>${item.quantity} x ${item.description} - $${(item.amount_total / 100).toFixed(2)}</li>`
+            ).join('');
+
+            const customerMailOptions = {
+                from: emailUser,
+                to: session.customer_email,
+                subject: 'Order Confirmation from Nobilis Crochet',
+                html: `
+                    <h1>Thank You for Your Order!</h1>
+                    <p>Hi ${session.shipping_details.name},</p>
+                    <p>Your order #${session.id.slice(-8)} has been confirmed. We'll send you another email when it ships.</p>
+                    <p><strong>Order Summary:</strong></p>
+                    <ul>${lineItemsHtml}</ul>
+                    <p>Total: $${(session.amount_total / 100).toFixed(2)}</p>
+                    <p>If you have any questions, please contact us.</p>
+                    <p>The Nobilis Crochet Team</p>
+                `,
+            };
+
+            const ownerMailOptions = {
+                from: emailUser,
+                to: emailRecipient,
+                subject: 'New Order Received',
+                html: `<p>A new order has been placed. Order ID: ${session.id}</p><p>Customer email: ${session.customer_email}</p>`,
+            };
+
+            try {
+                await transporter.sendMail(customerMailOptions);
+                console.log('Confirmation email sent to customer.');
+            } catch (emailError) {
+                console.error('Error sending confirmation email to customer:', emailError);
+            }
+
+            try {
+                await transporter.sendMail(ownerMailOptions);
+                console.log('Order notification email sent to owner.');
+            } catch (emailError) {
+                console.error('Error sending order notification email to owner:', emailError);
+            }
+
+        } catch (error) {
+            console.error('Error processing webhook event (database/email):', error);
+        }
+    }
+    
+    res.sendStatus(200);
+});
+
+// This global middleware should come AFTER the webhook route
 app.use(express.json());
 app.use(cors({ origin: frontendUrl, credentials: true }));
 app.use(session({
@@ -232,90 +317,6 @@ app.get('/order-details', async (req, res) => {
     }
 });
 
-
-// --- WEBHOOK ENDPOINT ---
-app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-    const stripe = getStripe();
-    const payload = req.body;
-    const sig = req.headers['stripe-signature'];
-    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
-
-    let event;
-
-    try {
-        event = stripe.webhooks.constructEvent(payload, sig, webhookSecret);
-        console.log('Webhook received:', event.type); // NEW: Log the event type
-    } catch (err) {
-        console.error(`Webhook signature verification failed:`, err.message);
-        return res.sendStatus(400);
-    }
-
-    // Handle the event
-    if (event.type === 'checkout.session.completed') {
-        const session = event.data.object;
-        console.log('Checkout Session completed:', session.id);
-
-        try {
-            // First, save the order to the database
-            const db = getDbPool();
-            const result = await db.query(
-                'INSERT INTO orders (order_id, amount_total, customer_email, line_items) VALUES ($1, $2, $3, $4) RETURNING *',
-                [session.id, session.amount_total / 100, session.customer_email, JSON.stringify(session.line_items.data)]
-            );
-            console.log('Order saved to database:', result.rows[0].order_id);
-
-            // Now, handle email sending with specific error logging
-            const transporter = getTransporter();
-
-            // Create a formatted list of line items for the email
-            const lineItemsHtml = session.line_items.data.map(item => 
-                `<li>${item.quantity} x ${item.description} - $${(item.amount_total / 100).toFixed(2)}</li>`
-            ).join('');
-
-            const customerMailOptions = {
-                from: emailUser,
-                to: session.customer_email,
-                subject: 'Order Confirmation from Nobilis Crochet',
-                html: `
-                    <h1>Thank You for Your Order!</h1>
-                    <p>Hi ${session.shipping_details.name},</p>
-                    <p>Your order #${session.id.slice(-8)} has been confirmed. We'll send you another email when it ships.</p>
-                    <p><strong>Order Summary:</strong></p>
-                    <ul>${lineItemsHtml}</ul>
-                    <p>Total: $${(session.amount_total / 100).toFixed(2)}</p>
-                    <p>If you have any questions, please contact us.</p>
-                    <p>The Nobilis Crochet Team</p>
-                `,
-            };
-
-            const ownerMailOptions = {
-                from: emailUser,
-                to: emailRecipient,
-                subject: 'New Order Received',
-                html: `<p>A new order has been placed. Order ID: ${session.id}</p><p>Customer email: ${session.customer_email}</p>`,
-            };
-
-            try {
-                await transporter.sendMail(customerMailOptions);
-                console.log('Confirmation email sent to customer.');
-            } catch (emailError) {
-                console.error('Error sending confirmation email to customer:', emailError);
-            }
-
-            try {
-                await transporter.sendMail(ownerMailOptions);
-                console.log('Order notification email sent to owner.');
-            } catch (emailError) {
-                console.error('Error sending order notification email to owner:', emailError);
-            }
-
-        } catch (error) {
-            console.error('Error processing webhook event (database/email):', error);
-        }
-    }
-    
-    res.sendStatus(200);
-});
 
 // --- SERVER LISTENER ---
 const PORT = process.env.PORT || 3000;
