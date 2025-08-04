@@ -54,9 +54,7 @@ function getDbPool() {
 
 // FIX: CORS middleware is now configured and placed at the very top of the middleware stack
 app.use(cors({ origin: frontendUrl, credentials: true }));
-
-// This global middleware should come AFTER the webhook route
-app.use(express.json());
+app.use(express.json()); // This is global for all other routes
 
 // --- MIDDLEWARE ---
 // The webhook endpoint must be defined BEFORE the global `express.json()` middleware
@@ -199,8 +197,6 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
 });
 
 // This global middleware should come AFTER the webhook route
-app.use(express.json());
-
 app.use(session({
     store: new PgSession({ pool: getDbPool(), tableName: 'sessions' }),
     secret: sessionSecret,
@@ -295,89 +291,39 @@ app.post('/api/reviews', ensureAuthenticated, async (req, res) => {
 
 
 // --- STRIPE ROUTES ---
+
 app.post('/create-checkout-session', async (req, res) => {
     const stripe = getStripe();
     const { cart } = req.body;
     
-    // Validate cart
+    // FIX: Ensure cart is an array before mapping
     if (!Array.isArray(cart) || cart.length === 0) {
         console.error("Error creating checkout session: Cart is empty or invalid.");
         return res.status(400).json({ error: 'Cart is empty or invalid.' });
     }
 
-    try {
-        const finalLineItems = cart.map((item, index) => {
-            // Validate required fields
-            if (!item.name) {
-                throw new Error(`Item at index ${index} is missing a name`);
-            }
-            
-            // Handle price - support multiple possible formats
-            let priceValue = 0;
-            if (item.price) {
-                if (typeof item.price === 'string') {
-                    // Remove $ and convert to number
-                    priceValue = parseFloat(item.price.replace(/[$,]/g, ''));
-                } else if (typeof item.price === 'number') {
-                    priceValue = item.price;
-                }
-            } else if (item.unit_amount) {
-                // If price is missing but unit_amount exists (in cents)
-                priceValue = item.unit_amount / 100;
-            } else {
-                throw new Error(`Item "${item.name}" is missing price information`);
-            }
-            
-            // Validate price
-            if (isNaN(priceValue) || priceValue <= 0) {
-                throw new Error(`Item "${item.name}" has invalid price: ${item.price}`);
-            }
-            
-            // Handle custom details metadata
-            const metadata = {};
-            if (item.images && typeof item.images === 'object') {
-                metadata.custom_details = JSON.stringify(item.images);
-            }
-            if (item.customDetails && typeof item.customDetails === 'object') {
-                metadata.custom_details = JSON.stringify(item.customDetails);
-            }
-            
-            // Handle product image
-            let productImage = null;
-            if (item.image) {
-                productImage = item.image;
-            } else if (item.images && item.images.head) {
-                productImage = item.images.head;
-            }
-            
-            // Build the line item
-            const lineItem = {
-                price_data: {
-                    currency: 'usd',
-                    product_data: {
-                        name: item.name,
-                        metadata: metadata
-                    },
-                    unit_amount: Math.round(priceValue * 100), // Convert to cents
+    const finalLineItems = cart.map(item => {
+        // FIX: Ensure item.price is a string before using .replace
+        const priceString = item.price && typeof item.price === 'string' ? item.price : '$0.00';
+        
+        const metadata = item.images ? { custom_details: JSON.stringify(item.images) } : {};
+        const image = item.images ? item.images.head : item.image;
+        
+        return {
+            price_data: {
+                currency: 'usd',
+                product_data: {
+                    name: item.name,
+                    images: [image],
+                    metadata: metadata
                 },
-                quantity: item.quantity || 1,
-            };
-            
-            // Add image if available
-            if (productImage) {
-                lineItem.price_data.product_data.images = [productImage];
-            }
-            
-            // Add description if available
-            if (item.description) {
-                lineItem.price_data.product_data.description = item.description;
-            }
-            
-            return lineItem;
-        });
+                unit_amount: Math.round(parseFloat(priceString.replace('$', '')) * 100),
+            },
+            quantity: item.quantity,
+        };
+    });
 
-        console.log('Creating checkout session with line items:', JSON.stringify(finalLineItems, null, 2));
-
+    try {
         const session = await stripe.checkout.sessions.create({
             payment_method_types: ['card'],
             line_items: finalLineItems,
@@ -388,25 +334,12 @@ app.post('/create-checkout-session', async (req, res) => {
                 allowed_countries: ['US'],
             },
         });
-        
         res.json({ url: session.url });
     } catch (error) {
-        console.error('Error creating checkout session:', error.message);
-        console.error('Cart data:', JSON.stringify(cart, null, 2));
-        res.status(500).json({ 
-            error: 'Failed to create checkout session',
-            details: error.message 
-        });
+        console.error('Error creating checkout session:', error);
+        res.status(500).json({ error: 'Failed to create checkout session' });
     }
 });
-
-
-
-
-
-
-
-
 
 // A route to get order details for the account page.
 app.get('/order-details', async (req, res) => {
