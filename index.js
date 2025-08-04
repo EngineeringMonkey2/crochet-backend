@@ -101,10 +101,36 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
             // Now, handle email sending with specific error logging
             const transporter = getTransporter();
 
-            const lineItemsHtml = session.line_items.data.map(item => 
-                `<li>${item.quantity} x ${item.description} - $${(item.amount_total / 100).toFixed(2)}</li>`
-            ).join('');
+            // Function to generate HTML for a single line item, including custom details
+            const formatLineItem = (item) => {
+                // Check if the item has our custom monkey metadata
+                if (item.price.product.metadata && item.price.product.metadata.custom_details) {
+                    const customDetails = JSON.parse(item.price.product.metadata.custom_details);
+                    const customDetailsHtml = Object.entries(customDetails).map(([part, url]) => 
+                        // We only want the filename, so we split the URL and get the last part
+                        `<li>${part}: ${url.split('/').pop()}</li>`
+                    ).join('');
+
+                    return `
+                        <li>
+                            <b>Item:</b> ${item.description} <br>
+                            <b>Quantity:</b> ${item.quantity} <br>
+                            <b>Price:</b> $${(item.amount_total / 100).toFixed(2)} <br>
+                            <b>Custom Details:</b>
+                            <ul>
+                                ${customDetailsHtml}
+                            </ul>
+                        </li>
+                    `;
+                } else {
+                    // For a regular product, just return the standard list item
+                    return `<li>${item.quantity} x ${item.description} - $${(item.amount_total / 100).toFixed(2)}</li>`;
+                }
+            };
             
+            // Map all line items to a formatted HTML string
+            const lineItemsHtml = session.line_items.data.map(formatLineItem).join('');
+
             const customerMailOptions = {
                 from: emailUser,
                 to: customer.email,
@@ -121,7 +147,7 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
                 `,
             };
 
-            // FIX: Updated the email template for the store owner
+            // FIX: Updated the email template for the store owner with detailed custom product information
             const ownerMailOptions = {
                 from: emailUser,
                 to: emailRecipient,
@@ -132,7 +158,7 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
                     <p><b>Customer Name:</b> ${customer.name || 'N/A'}</p>
                     <p><b>Customer Email:</b> ${customer.email || 'N/A'}</p>
                     <hr>
-                    <h3>Order Summary:</h3>
+                    <h3>Order Details:</h3>
                     <ul>${lineItemsHtml}</ul>
                     <p><b>Total:</b> $${(session.amount_total / 100).toFixed(2)}</p>
                     <hr>
@@ -271,17 +297,30 @@ app.post('/create-checkout-session', async (req, res) => {
     const { cart } = req.body;
     
     // Convert cart items to Stripe line item format
-    const lineItems = cart.map(item => ({
-        price_data: {
-            currency: 'usd',
-            product_data: {
-                name: item.name,
-                images: [item.image]
+    const lineItems = cart.map(item => {
+        // Prepare the product data, including metadata for custom items
+        const productData = {
+            name: item.name,
+            images: item.image ? [item.image] : undefined // Handle cases where a single image URL might not be present
+        };
+        
+        // If it's a custom monkey, add the image URLs for each part to metadata
+        if (item.name === 'Custom Monkey' && item.images) {
+            // The metadata value must be a string, so we use JSON.stringify()
+            productData.metadata = {
+                custom_details: JSON.stringify(item.images)
+            };
+        }
+
+        return {
+            price_data: {
+                currency: 'usd',
+                product_data: productData,
+                unit_amount: Math.round(parseFloat(item.price.replace('$', '')) * 100), // Stripe expects cents
             },
-            unit_amount: Math.round(parseFloat(item.price.replace('$', '')) * 100), // Stripe expects cents
-        },
-        quantity: item.quantity,
-    }));
+            quantity: item.quantity,
+        };
+    });
 
     try {
         const session = await stripe.checkout.sessions.create({
