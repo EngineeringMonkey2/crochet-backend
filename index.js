@@ -304,11 +304,16 @@ app.post('/create-checkout-session', async (req, res) => {
             images: item.image ? [item.image] : undefined // Handle cases where a single image URL might not be present
         };
         
-        // If it's a custom monkey, add the image URLs for each part to metadata
+        // If it's a custom monkey, add the image filenames to metadata
         if (item.name === 'Custom Monkey' && item.images) {
-            // The metadata value must be a string, so we use JSON.stringify()
+            const shortImages = {};
+            for (const part in item.images) {
+                // Extract only the filename from the full URL to stay within Stripe's metadata character limit
+                shortImages[part] = item.images[part].split('/').pop();
+            }
             productData.metadata = {
-                custom_details: JSON.stringify(item.images)
+                // The metadata value must be a string, so we use JSON.stringify()
+                custom_details: JSON.stringify(shortImages)
             };
         }
 
