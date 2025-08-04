@@ -196,7 +196,6 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
     res.sendStatus(200);
 });
 
-// This global middleware should come AFTER the webhook route
 app.use(session({
     store: new PgSession({ pool: getDbPool(), tableName: 'sessions' }),
     secret: sessionSecret,
@@ -301,11 +300,25 @@ app.post('/create-checkout-session', async (req, res) => {
         console.error("Error creating checkout session: Cart is empty or invalid.");
         return res.status(400).json({ error: 'Cart is empty or invalid.' });
     }
-
+    
     const finalLineItems = cart.map(item => {
-        // FIX: Ensure item.price is a string before using .replace
-        const priceString = item.price && typeof item.price === 'string' ? item.price : '$0.00';
-        
+        // FIX: Add robust price parsing to handle different formats and prevent errors
+        let priceValue;
+        if (item.price && typeof item.price === 'string') {
+            const sanitizedPrice = item.price.replace(/[$,]/g, '');
+            priceValue = Math.round(parseFloat(sanitizedPrice) * 100);
+        } else if (typeof item.price === 'number') {
+            priceValue = Math.round(item.price * 100);
+        } else {
+            console.error(`Error: Invalid price for item "${item.name}". Price received:`, item.price);
+            return null; // Return null for invalid items
+        }
+
+        if (isNaN(priceValue)) {
+            console.error(`Error: Could not parse price for item "${item.name}". Price received:`, item.price);
+            return null;
+        }
+
         const metadata = item.images ? { custom_details: JSON.stringify(item.images) } : {};
         const image = item.images ? item.images.head : item.image;
         
@@ -317,11 +330,16 @@ app.post('/create-checkout-session', async (req, res) => {
                     images: [image],
                     metadata: metadata
                 },
-                unit_amount: Math.round(parseFloat(priceString.replace('$', '')) * 100),
+                unit_amount: priceValue,
             },
             quantity: item.quantity,
         };
-    });
+    }).filter(item => item !== null); // Filter out any items that failed validation
+
+    if (finalLineItems.length === 0) {
+        console.error("Error creating checkout session: All cart items failed validation.");
+        return res.status(400).json({ error: 'All cart items failed validation.' });
+    }
 
     try {
         const session = await stripe.checkout.sessions.create({
