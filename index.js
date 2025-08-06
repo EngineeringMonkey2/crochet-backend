@@ -59,7 +59,6 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
 
     try {
         event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
-        console.log('Webhook received:', event.type);
     } catch (err) {
         console.error(`Webhook signature verification failed:`, err.message);
         return res.sendStatus(400);
@@ -73,9 +72,13 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
             });
             const customer = session.customer ? session.customer : { email: checkoutSession.customer_details.email, name: checkoutSession.customer_details.name || 'Customer' };
             const db = getDbPool();
+
+            // NEW: Calculate the total number of items to set the review credits
+            const totalItems = session.line_items.data.reduce((sum, item) => sum + item.quantity, 0);
+
             await db.query(
-                'INSERT INTO orders (order_id, amount_total, customer_email, line_items) VALUES ($1, $2, $3, $4) RETURNING *',
-                [session.id, session.amount_total / 100, customer.email, JSON.stringify(session.line_items.data)]
+                'INSERT INTO orders (order_id, amount_total, customer_email, line_items, review_uses_remaining) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+                [session.id, session.amount_total / 100, customer.email, JSON.stringify(session.line_items.data), totalItems]
             );
             
             const transporter = getTransporter();
@@ -109,12 +112,7 @@ app.use(session({
     secret: sessionSecret,
     resave: false,
     saveUninitialized: false,
-    cookie: {
-        secure: true,
-        sameSite: 'none',
-        httpOnly: true,
-        maxAge: 24 * 60 * 60 * 1000
-    }
+    cookie: { secure: true, sameSite: 'none', httpOnly: true, maxAge: 24 * 60 * 60 * 1000 }
 }));
 app.use(passport.initialize());
 app.use(passport.session());
@@ -161,7 +159,7 @@ app.get('/auth/google/callback', passport.authenticate('google', {
     failureRedirect: `${frontendUrl}/login.html?error=true`,
     successRedirect: `${frontendUrl}/account.html`,
 }));
-app.post('/auth/logout', (req, res) => {
+app.post('/auth/logout', (req, res, next) => {
     req.logout((err) => {
         if (err) { return next(err); }
         res.redirect(`${frontendUrl}/`);
@@ -190,24 +188,10 @@ app.get('/api/reviews/:productId', async (req, res) => {
     }
 });
 
-app.post('/api/reviews', ensureAuthenticated, async (req, res) => {
-    const db = getDbPool();
-    const { productId, rating, comment } = req.body;
-    const { google_id: userId, display_name: userName } = req.user;
-    try {
-        const result = await db.query(
-            'INSERT INTO reviews (product_id, user_id, user_name, rating, comment) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (product_id, user_id) DO UPDATE SET rating = EXCLUDED.rating, comment = EXCLUDED.comment, created_at = NOW() RETURNING *',
-            [productId, userId, userName, rating, comment]
-        );
-        res.status(201).json(result.rows[0]);
-    } catch (error) {
-        res.status(500).json({ error: 'Failed to post review' });
-    }
-});
-
+// UPDATED: Review verification route with new logic
 app.post('/api/verify-order-for-review', ensureAuthenticated, async (req, res) => {
     const { orderId, productId } = req.body;
-    const { email: userEmail } = req.user;
+    const { email: userEmail, google_id: userId } = req.user;
     const db = getDbPool();
     try {
         const orderResult = await db.query('SELECT * FROM orders WHERE order_id = $1', [orderId]);
@@ -218,15 +202,66 @@ app.post('/api/verify-order-for-review', ensureAuthenticated, async (req, res) =
         if (order.customer_email !== userEmail) {
             return res.status(403).json({ verified: false, message: 'This order does not belong to you.' });
         }
-        const lineItems = JSON.parse(order.line_items);
-        const hasPurchased = lineItems.some(item => String(item.price?.product?.metadata?.productId) === String(productId));
-        if (!hasPurchased) {
-            return res.status(400).json({ verified: false, message: 'This order does not contain the specified product.' });
+        if (order.review_uses_remaining <= 0) {
+            return res.status(400).json({ verified: false, message: 'All reviews for this order have been used.' });
+        }
+        const reviewResult = await db.query('SELECT * FROM reviews WHERE user_id = $1 AND product_id = $2', [userId, productId]);
+        if (reviewResult.rows.length > 0) {
+            return res.status(400).json({ verified: false, message: 'You have already reviewed this product.' });
         }
         res.json({ verified: true });
     } catch (error) {
         console.error('Error verifying order for review:', error);
         res.status(500).json({ verified: false, message: 'An internal error occurred.' });
+    }
+});
+
+// UPDATED: Review submission route with new logic
+app.post('/api/reviews', ensureAuthenticated, async (req, res) => {
+    const { orderId, productId, rating, comment } = req.body;
+    const { email: userEmail, google_id: userId, display_name: userName } = req.user;
+    const db = getDbPool();
+    const client = await db.connect(); // Get a client from the pool for a transaction
+
+    try {
+        // --- Start Transaction ---
+        await client.query('BEGIN');
+
+        // 1. Verify the order again inside the transaction to prevent race conditions
+        const orderResult = await client.query('SELECT * FROM orders WHERE order_id = $1 FOR UPDATE', [orderId]); // Lock the row
+        if (orderResult.rows.length === 0) throw new Error('Order not found.');
+        const order = orderResult.rows[0];
+        if (order.customer_email !== userEmail) throw new Error('This order does not belong to you.');
+        if (order.review_uses_remaining <= 0) throw new Error('All reviews for this order have been used.');
+        
+        // 2. Check if the user has already reviewed this product
+        const reviewResult = await client.query('SELECT * FROM reviews WHERE user_id = $1 AND product_id = $2', [userId, productId]);
+        if (reviewResult.rows.length > 0) throw new Error('You have already reviewed this product.');
+
+        // 3. Insert the new review
+        const insertReviewResult = await client.query(
+            'INSERT INTO reviews (product_id, user_id, user_name, rating, comment, order_id_used) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+            [productId, userId, userName, rating, comment, orderId]
+        );
+
+        // 4. Decrement the review uses for the order
+        await client.query(
+            'UPDATE orders SET review_uses_remaining = review_uses_remaining - 1 WHERE order_id = $1',
+            [orderId]
+        );
+
+        // --- Commit Transaction ---
+        await client.query('COMMIT');
+        res.status(201).json(insertReviewResult.rows[0]);
+
+    } catch (error) {
+        // --- Rollback Transaction on Error ---
+        await client.query('ROLLBACK');
+        console.error('Error posting review:', error);
+        res.status(500).json({ error: error.message || 'Failed to post review' });
+    } finally {
+        // --- Release Client ---
+        client.release();
     }
 });
 
@@ -260,7 +295,6 @@ app.post('/create-checkout-session', async (req, res) => {
     }
 });
 
-// This is the route for the receipt page, using the logic from your working version
 app.get('/order-details', async (req, res) => {
     const stripe = getStripe();
     try {
@@ -269,7 +303,7 @@ app.get('/order-details', async (req, res) => {
             return res.status(400).json({ error: 'Session ID is required.' });
         }
         const session = await stripe.checkout.sessions.retrieve(session_id, {
-            expand: ['line_items.data.price.product'], // Ensure product data is expanded
+            expand: ['line_items.data.price.product'],
         });
         res.json({
             id: session.id,
