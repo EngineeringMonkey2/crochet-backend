@@ -73,7 +73,6 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
             const customer = session.customer ? session.customer : { email: checkoutSession.customer_details.email, name: checkoutSession.customer_details.name || 'Customer' };
             const db = getDbPool();
 
-            // NEW: Calculate the total number of items to set the review credits
             const totalItems = session.line_items.data.reduce((sum, item) => sum + item.quantity, 0);
 
             await db.query(
@@ -83,20 +82,42 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
             
             const transporter = getTransporter();
             const lineItemsHtml = session.line_items.data.map(item => `<li>${item.quantity} x ${item.description} - $${(item.amount_total / 100).toFixed(2)}</li>`).join('');
+            
             const customerMailOptions = {
                 from: emailUser,
                 to: customer.email,
                 subject: 'Order Confirmation from Nobilis Crochet',
-                html: `<h1>Thank You for Your Order!</h1><p>Hi ${customer.name || 'Customer'},</p><p>Your order #${session.id.slice(-8)} has been confirmed.</p><p><strong>Order Summary:</strong></p><ul>${lineItemsHtml}</ul><p>Total: $${(session.amount_total / 100).toFixed(2)}</p>`,
+                html: `<h1>Thank You for Your Order!</h1><p>Hi ${customer.name || 'Customer'},</p><p>Your order #${session.id.slice(-8)} has been confirmed. We'll send you another email when it ships.</p><p><strong>Order Summary:</strong></p><ul>${lineItemsHtml}</ul><p>Total: $${(session.amount_total / 100).toFixed(2)}</p><p>If you have any questions, please contact us.</p><p>The Nobilis Crochet Team</p>`,
             };
+
+            // FIXED: Restored the full shipping address details to the owner's notification email
             const ownerMailOptions = {
                 from: emailUser,
                 to: emailRecipient,
                 subject: `NEW ORDER #${session.id.slice(-8)} from ${customer.name || 'Customer'}`,
-                html: `<h1>New Order Received!</h1><p><b>Order ID:</b> ${session.id}</p><p><b>Customer Email:</b> ${customer.email || 'N/A'}</p><hr><h3>Order Details:</h3><ul>${lineItemsHtml}</ul><p><b>Total:</b> $${(session.amount_total / 100).toFixed(2)}</p>`,
+                html: `
+                    <h1>New Order Received!</h1>
+                    <p><b>Order ID:</b> ${session.id}</p>
+                    <p><b>Customer Name:</b> ${customer.name || 'N/A'}</p>
+                    <p><b>Customer Email:</b> ${customer.email || 'N/A'}</p>
+                    <hr>
+                    <h3>Order Details:</h3>
+                    <ul>${lineItemsHtml}</ul>
+                    <p><b>Total:</b> $${(session.amount_total / 100).toFixed(2)}</p>
+                    <hr>
+                    <h3>Shipping Address:</h3>
+                    <p>
+                        ${session.shipping_details ? session.shipping_details.name : 'N/A'}<br>
+                        ${session.shipping_details ? (session.shipping_details.address.line1 || 'N/A') : ''}${session.shipping_details && session.shipping_details.address.line2 ? '<br>' + session.shipping_details.address.line2 : ''}<br>
+                        ${session.shipping_details ? (session.shipping_details.address.city || 'N/A') : ''}, ${session.shipping_details ? (session.shipping_details.address.state || 'N/A') : ''} ${session.shipping_details ? (session.shipping_details.address.postal_code || 'N/A') : ''}<br>
+                        ${session.shipping_details ? (session.shipping_details.address.country || 'N/A') : ''}
+                    </p>
+                `,
             };
+
             await transporter.sendMail(customerMailOptions);
             await transporter.sendMail(ownerMailOptions);
+
         } catch (error) {
             console.error('Error processing webhook event:', error);
         }
@@ -188,7 +209,6 @@ app.get('/api/reviews/:productId', async (req, res) => {
     }
 });
 
-// UPDATED: Review verification route with new logic
 app.post('/api/verify-order-for-review', ensureAuthenticated, async (req, res) => {
     const { orderId, productId } = req.body;
     const { email: userEmail, google_id: userId } = req.user;
@@ -216,51 +236,35 @@ app.post('/api/verify-order-for-review', ensureAuthenticated, async (req, res) =
     }
 });
 
-// UPDATED: Review submission route with new logic
 app.post('/api/reviews', ensureAuthenticated, async (req, res) => {
     const { orderId, productId, rating, comment } = req.body;
     const { email: userEmail, google_id: userId, display_name: userName } = req.user;
     const db = getDbPool();
-    const client = await db.connect(); // Get a client from the pool for a transaction
-
+    const client = await db.connect();
     try {
-        // --- Start Transaction ---
         await client.query('BEGIN');
-
-        // 1. Verify the order again inside the transaction to prevent race conditions
-        const orderResult = await client.query('SELECT * FROM orders WHERE order_id = $1 FOR UPDATE', [orderId]); // Lock the row
+        const orderResult = await client.query('SELECT * FROM orders WHERE order_id = $1 FOR UPDATE', [orderId]);
         if (orderResult.rows.length === 0) throw new Error('Order not found.');
         const order = orderResult.rows[0];
         if (order.customer_email !== userEmail) throw new Error('This order does not belong to you.');
         if (order.review_uses_remaining <= 0) throw new Error('All reviews for this order have been used.');
-        
-        // 2. Check if the user has already reviewed this product
         const reviewResult = await client.query('SELECT * FROM reviews WHERE user_id = $1 AND product_id = $2', [userId, productId]);
         if (reviewResult.rows.length > 0) throw new Error('You have already reviewed this product.');
-
-        // 3. Insert the new review
         const insertReviewResult = await client.query(
             'INSERT INTO reviews (product_id, user_id, user_name, rating, comment, order_id_used) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
             [productId, userId, userName, rating, comment, orderId]
         );
-
-        // 4. Decrement the review uses for the order
         await client.query(
             'UPDATE orders SET review_uses_remaining = review_uses_remaining - 1 WHERE order_id = $1',
             [orderId]
         );
-
-        // --- Commit Transaction ---
         await client.query('COMMIT');
         res.status(201).json(insertReviewResult.rows[0]);
-
     } catch (error) {
-        // --- Rollback Transaction on Error ---
         await client.query('ROLLBACK');
         console.error('Error posting review:', error);
         res.status(500).json({ error: error.message || 'Failed to post review' });
     } finally {
-        // --- Release Client ---
         client.release();
     }
 });
