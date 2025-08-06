@@ -194,13 +194,11 @@ app.get('/api/reviews/:productId', async (req, res) => {
     }
 });
 
-// UPDATED: Review verification route with improved order lookup
 app.post('/api/verify-order-for-review', ensureAuthenticated, async (req, res) => {
     const { orderId, productId } = req.body;
     const { email: userEmail, google_id: userId } = req.user;
     const db = getDbPool();
     try {
-        // FIX: Search for an order ID that is an exact match OR ends with the provided ID
         const orderResult = await db.query("SELECT * FROM orders WHERE order_id = $1 OR order_id LIKE '%' || $1", [orderId]);
         if (orderResult.rows.length === 0) return res.status(404).json({ verified: false, message: 'Order not found.' });
         
@@ -235,11 +233,11 @@ app.post('/api/reviews', ensureAuthenticated, async (req, res) => {
         
         const insertReviewResult = await client.query(
             'INSERT INTO reviews (product_id, user_id, user_name, rating, comment, order_id_used) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
-            [productId, userId, userName, rating, comment, order.order_id] // Use the full order ID
+            [productId, userId, userName, rating, comment, order.order_id]
         );
         await client.query(
             'UPDATE orders SET review_uses_remaining = review_uses_remaining - 1 WHERE order_id = $1',
-            [order.order_id] // Use the full order ID
+            [order.order_id]
         );
         await client.query('COMMIT');
         res.status(201).json(insertReviewResult.rows[0]);
