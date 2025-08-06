@@ -59,6 +59,7 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
 
     try {
         event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+        console.log('Webhook received:', event.type);
     } catch (err) {
         console.error(`Webhook signature verification failed:`, err.message);
         return res.sendStatus(400);
@@ -77,7 +78,6 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
                 [session.id, session.amount_total / 100, customer.email, JSON.stringify(session.line_items.data)]
             );
             
-            // --- RESTORED EMAIL LOGIC ---
             const transporter = getTransporter();
             const lineItemsHtml = session.line_items.data.map(item => `<li>${item.quantity} x ${item.description} - $${(item.amount_total / 100).toFixed(2)}</li>`).join('');
             const customerMailOptions = {
@@ -94,7 +94,6 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
             };
             await transporter.sendMail(customerMailOptions);
             await transporter.sendMail(ownerMailOptions);
-
         } catch (error) {
             console.error('Error processing webhook event:', error);
         }
@@ -163,7 +162,10 @@ app.get('/auth/google/callback', passport.authenticate('google', {
     successRedirect: `${frontendUrl}/account.html`,
 }));
 app.post('/auth/logout', (req, res) => {
-    req.logout(() => res.redirect(`${frontendUrl}/`));
+    req.logout((err) => {
+        if (err) { return next(err); }
+        res.redirect(`${frontendUrl}/`);
+    });
 });
 
 app.get('/api/user', (req, res) => res.json({ user: req.user || null }));
@@ -203,42 +205,30 @@ app.post('/api/reviews', ensureAuthenticated, async (req, res) => {
     }
 });
 
-// NEW: Route to verify an order by ID for leaving a review
 app.post('/api/verify-order-for-review', ensureAuthenticated, async (req, res) => {
     const { orderId, productId } = req.body;
     const { email: userEmail } = req.user;
     const db = getDbPool();
-
     try {
         const orderResult = await db.query('SELECT * FROM orders WHERE order_id = $1', [orderId]);
-
         if (orderResult.rows.length === 0) {
             return res.status(404).json({ verified: false, message: 'Order not found.' });
         }
-
         const order = orderResult.rows[0];
-
         if (order.customer_email !== userEmail) {
             return res.status(403).json({ verified: false, message: 'This order does not belong to you.' });
         }
-
         const lineItems = JSON.parse(order.line_items);
-        const hasPurchased = lineItems.some(item => 
-            String(item.price?.product?.metadata?.productId) === String(productId)
-        );
-
+        const hasPurchased = lineItems.some(item => String(item.price?.product?.metadata?.productId) === String(productId));
         if (!hasPurchased) {
             return res.status(400).json({ verified: false, message: 'This order does not contain the specified product.' });
         }
-
         res.json({ verified: true });
-
     } catch (error) {
         console.error('Error verifying order for review:', error);
         res.status(500).json({ verified: false, message: 'An internal error occurred.' });
     }
 });
-
 
 app.post('/create-checkout-session', async (req, res) => {
     const stripe = getStripe();
@@ -255,7 +245,6 @@ app.post('/create-checkout-session', async (req, res) => {
         },
         quantity: item.quantity,
     }));
-
     try {
         const session = await stripe.checkout.sessions.create({
             payment_method_types: ['card'],
@@ -268,6 +257,29 @@ app.post('/create-checkout-session', async (req, res) => {
         res.json({ url: session.url });
     } catch (error) {
         res.status(500).json({ error: 'Failed to create checkout session' });
+    }
+});
+
+// This is the route for the receipt page, using the logic from your working version
+app.get('/order-details', async (req, res) => {
+    const stripe = getStripe();
+    try {
+        const { session_id } = req.query;
+        if (!session_id) {
+            return res.status(400).json({ error: 'Session ID is required.' });
+        }
+        const session = await stripe.checkout.sessions.retrieve(session_id, {
+            expand: ['line_items.data.price.product'], // Ensure product data is expanded
+        });
+        res.json({
+            id: session.id,
+            amount_total: session.amount_total / 100,
+            shipping_details: session.shipping_details,
+            line_items: session.line_items.data,
+        });
+    } catch (error) {
+        console.error('Error fetching order details:', error);
+        res.status(500).json({ error: 'Failed to fetch order details.' });
     }
 });
 
