@@ -74,16 +74,13 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
             const customer = session.customer ? session.customer : { email: checkoutSession.customer_details.email, name: checkoutSession.customer_details.name || 'Customer' };
             const db = getDbPool();
             
-            // MERGED: Calculate total items for review credits
             const totalItems = session.line_items.data.reduce((sum, item) => sum + item.quantity, 0);
 
-            // MERGED: Add review_uses_remaining to the database insert
             await db.query(
                 'INSERT INTO orders (order_id, amount_total, customer_email, line_items, review_uses_remaining) VALUES ($1, $2, $3, $4, $5) RETURNING *',
                 [session.id, session.amount_total / 100, customer.email, JSON.stringify(session.line_items.data), totalItems]
             );
 
-            // PRESERVED: Your working email logic
             const transporter = getTransporter();
             const formatLineItem = (item) => {
                 const metadata = item.price && item.price.product ? item.price.product.metadata : {};
