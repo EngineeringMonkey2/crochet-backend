@@ -32,10 +32,12 @@ let stripeInstance, transporter, dbPool;
 function getStripe() { if (!stripeInstance) { stripeInstance = stripe(stripeSecretKey); } return stripeInstance; }
 function getTransporter() {
     if (!transporter) {
+        console.log("Attempting to create email transporter...");
         transporter = nodemailer.createTransport({
             service: 'gmail',
             auth: { user: emailUser, pass: emailPass }
         });
+        console.log("Email transporter created.");
     }
     return transporter;
 }
@@ -74,6 +76,52 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
                 'INSERT INTO orders (order_id, amount_total, customer_email, line_items) VALUES ($1, $2, $3, $4) RETURNING *',
                 [session.id, session.amount_total / 100, customer.email, JSON.stringify(session.line_items.data)]
             );
+            
+            // --- RESTORED EMAIL LOGIC ---
+            const transporter = getTransporter();
+
+            const formatLineItem = (item) => {
+                const metadata = item.price && item.price.product ? item.price.product.metadata : {};
+                if (metadata.custom_details) {
+                    const customDetails = JSON.parse(metadata.custom_details);
+                    const customDetailsHtml = Object.entries(customDetails).map(([part, filename]) => `<li>${part}: ${filename}</li>`).join('');
+                    return `<li><b>Item:</b> ${item.description} <br><b>Quantity:</b> ${item.quantity} <br><b>Price:</b> $${(item.amount_total / 100).toFixed(2)} <br><b>Custom Details:</b><ul>${customDetailsHtml}</ul></li>`;
+                } else {
+                    return `<li>${item.quantity} x ${item.description} - $${(item.amount_total / 100).toFixed(2)}</li>`;
+                }
+            };
+
+            const lineItemsHtml = session.line_items.data.map(formatLineItem).join('');
+
+            const customerMailOptions = {
+                from: emailUser,
+                to: customer.email,
+                subject: 'Order Confirmation from Nobilis Crochet',
+                html: `<h1>Thank You for Your Order!</h1><p>Hi ${customer.name || 'Customer'},</p><p>Your order #${session.id.slice(-8)} has been confirmed. We'll send you another email when it ships.</p><p><strong>Order Summary:</strong></p><ul>${lineItemsHtml}</ul><p>Total: $${(session.amount_total / 100).toFixed(2)}</p><p>If you have any questions, please contact us.</p><p>The Nobilis Crochet Team</p>`,
+            };
+
+            const ownerMailOptions = {
+                from: emailUser,
+                to: emailRecipient,
+                subject: `NEW ORDER #${session.id.slice(-8)} from ${customer.name || 'Customer'}`,
+                html: `<h1>New Order Received!</h1><p><b>Order ID:</b> ${session.id}</p><p><b>Customer Name:</b> ${customer.name || 'N/A'}</p><p><b>Customer Email:</b> ${customer.email || 'N/A'}</p><hr><h3>Order Details:</h3><ul>${lineItemsHtml}</ul><p><b>Total:</b> $${(session.amount_total / 100).toFixed(2)}</p><hr><h3>Shipping Address:</h3><p>${session.shipping_details ? session.shipping_details.name : 'N/A'}<br>${session.shipping_details ? (session.shipping_details.address.line1 || 'N/A') : ''}${session.shipping_details && session.shipping_details.address.line2 ? '<br>' + session.shipping_details.address.line2 : ''}<br>${session.shipping_details ? (session.shipping_details.address.city || 'N/A') : ''}, ${session.shipping_details ? (session.shipping_details.address.state || 'N/A') : ''} ${session.shipping_details ? (session.shipping_details.address.postal_code || 'N/A') : ''}<br>${session.shipping_details ? (session.shipping_details.address.country || 'N/A') : ''}</p>`,
+            };
+
+            try {
+                await transporter.sendMail(customerMailOptions);
+                console.log('Confirmation email sent to customer.');
+            } catch (emailError) {
+                console.error('Error sending confirmation email to customer:', emailError);
+            }
+
+            try {
+                await transporter.sendMail(ownerMailOptions);
+                console.log('Order notification email sent to owner.');
+            } catch (emailError) {
+                console.error('Error sending order notification email to owner:', emailError);
+            }
+            // --- END OF RESTORED EMAIL LOGIC ---
+
         } catch (error) {
             console.error('Error processing webhook event:', error);
         }
@@ -193,7 +241,6 @@ app.post('/api/reviews', ensureAuthenticated, async (req, res) => {
     }
 });
 
-// UPDATED: Route to check if a user has purchased a specific product
 app.get('/api/user/has-purchased/:productId', ensureAuthenticated, async (req, res) => {
     try {
         const { productId } = req.params;
@@ -207,12 +254,10 @@ app.get('/api/user/has-purchased/:productId', ensureAuthenticated, async (req, r
 
         let hasPurchased = false;
         for (const order of ordersResult.rows) {
-            // FIX: The line_items from the DB are stored as a JSON string. It must be parsed.
             const lineItems = JSON.parse(order.line_items);
             if (Array.isArray(lineItems)) {
                 for (const item of lineItems) {
                     const metadataProductId = item.price?.product?.metadata?.productId;
-                    // Check if the product ID from the order metadata matches the one we're looking for.
                     if (String(metadataProductId) === String(productId)) {
                         hasPurchased = true;
                         break;
