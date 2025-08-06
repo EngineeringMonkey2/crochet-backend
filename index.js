@@ -59,7 +59,6 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
 
     try {
         event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
-        console.log('Webhook received:', event.type);
     } catch (err) {
         console.error(`Webhook signature verification failed:`, err.message);
         return res.sendStatus(400);
@@ -194,21 +193,41 @@ app.get('/api/reviews/:productId', async (req, res) => {
     }
 });
 
+// UPDATED: Review verification route with detailed logging
 app.post('/api/verify-order-for-review', ensureAuthenticated, async (req, res) => {
     const { orderId, productId } = req.body;
     const { email: userEmail, google_id: userId } = req.user;
     const db = getDbPool();
+
+    console.log(`--- Review Verification Attempt ---`);
+    console.log(`User: ${userEmail}, Order ID: ${orderId}, Product ID: ${productId}`);
+
     try {
         const orderResult = await db.query("SELECT * FROM orders WHERE order_id = $1 OR order_id LIKE '%' || $1", [orderId]);
-        if (orderResult.rows.length === 0) return res.status(404).json({ verified: false, message: 'Order not found.' });
+        if (orderResult.rows.length === 0) {
+            console.log(`Verification FAILED: Order ID "${orderId}" not found in database.`);
+            return res.status(404).json({ verified: false, message: 'Order not found.' });
+        }
         
         const order = orderResult.rows[0];
-        if (order.customer_email !== userEmail) return res.status(403).json({ verified: false, message: 'This order does not belong to you.' });
-        if (order.review_uses_remaining <= 0) return res.status(400).json({ verified: false, message: 'All reviews for this order have been used.' });
+        console.log(`Order found: ${order.order_id} with ${order.review_uses_remaining} reviews remaining.`);
+
+        if (order.customer_email !== userEmail) {
+            console.log(`Verification FAILED: Order email (${order.customer_email}) does not match user email (${userEmail}).`);
+            return res.status(403).json({ verified: false, message: 'This order does not belong to you.' });
+        }
+        if (order.review_uses_remaining <= 0) {
+            console.log(`Verification FAILED: Order has no review credits left.`);
+            return res.status(400).json({ verified: false, message: 'All reviews for this order have been used.' });
+        }
         
         const reviewResult = await db.query('SELECT * FROM reviews WHERE user_id = $1 AND product_id = $2', [userId, productId]);
-        if (reviewResult.rows.length > 0) return res.status(400).json({ verified: false, message: 'You have already reviewed this product.' });
+        if (reviewResult.rows.length > 0) {
+            console.log(`Verification FAILED: User has already reviewed product ${productId}.`);
+            return res.status(400).json({ verified: false, message: 'You have already reviewed this product.' });
+        }
         
+        console.log(`Verification SUCCESSFUL for user ${userEmail} and order ${order.order_id}.`);
         res.json({ verified: true });
     } catch (error) {
         console.error('Error verifying order for review:', error);
