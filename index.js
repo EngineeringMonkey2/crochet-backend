@@ -194,20 +194,26 @@ app.get('/api/reviews/:productId', async (req, res) => {
     }
 });
 
+// UPDATED: Review verification route with improved order lookup
 app.post('/api/verify-order-for-review', ensureAuthenticated, async (req, res) => {
     const { orderId, productId } = req.body;
     const { email: userEmail, google_id: userId } = req.user;
     const db = getDbPool();
     try {
-        const orderResult = await db.query('SELECT * FROM orders WHERE order_id = $1', [orderId]);
+        // FIX: Search for an order ID that is an exact match OR ends with the provided ID
+        const orderResult = await db.query("SELECT * FROM orders WHERE order_id = $1 OR order_id LIKE '%' || $1", [orderId]);
         if (orderResult.rows.length === 0) return res.status(404).json({ verified: false, message: 'Order not found.' });
+        
         const order = orderResult.rows[0];
         if (order.customer_email !== userEmail) return res.status(403).json({ verified: false, message: 'This order does not belong to you.' });
         if (order.review_uses_remaining <= 0) return res.status(400).json({ verified: false, message: 'All reviews for this order have been used.' });
+        
         const reviewResult = await db.query('SELECT * FROM reviews WHERE user_id = $1 AND product_id = $2', [userId, productId]);
         if (reviewResult.rows.length > 0) return res.status(400).json({ verified: false, message: 'You have already reviewed this product.' });
+        
         res.json({ verified: true });
     } catch (error) {
+        console.error('Error verifying order for review:', error);
         res.status(500).json({ verified: false, message: 'An internal error occurred.' });
     }
 });
@@ -219,22 +225,27 @@ app.post('/api/reviews', ensureAuthenticated, async (req, res) => {
     const client = await db.connect();
     try {
         await client.query('BEGIN');
-        const orderResult = await client.query('SELECT * FROM orders WHERE order_id = $1 FOR UPDATE', [orderId]);
+        const orderResult = await client.query("SELECT * FROM orders WHERE order_id = $1 OR order_id LIKE '%' || $1 FOR UPDATE", [orderId]);
         if (orderResult.rows.length === 0) throw new Error('Order not found.');
         const order = orderResult.rows[0];
         if (order.customer_email !== userEmail) throw new Error('This order does not belong to you.');
         if (order.review_uses_remaining <= 0) throw new Error('All reviews for this order have been used.');
         const reviewResult = await client.query('SELECT * FROM reviews WHERE user_id = $1 AND product_id = $2', [userId, productId]);
         if (reviewResult.rows.length > 0) throw new Error('You have already reviewed this product.');
+        
         const insertReviewResult = await client.query(
             'INSERT INTO reviews (product_id, user_id, user_name, rating, comment, order_id_used) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
-            [productId, userId, userName, rating, comment, orderId]
+            [productId, userId, userName, rating, comment, order.order_id] // Use the full order ID
         );
-        await client.query('UPDATE orders SET review_uses_remaining = review_uses_remaining - 1 WHERE order_id = $1', [orderId]);
+        await client.query(
+            'UPDATE orders SET review_uses_remaining = review_uses_remaining - 1 WHERE order_id = $1',
+            [order.order_id] // Use the full order ID
+        );
         await client.query('COMMIT');
         res.status(201).json(insertReviewResult.rows[0]);
     } catch (error) {
         await client.query('ROLLBACK');
+        console.error('Error posting review:', error);
         res.status(500).json({ error: error.message || 'Failed to post review' });
     } finally {
         client.release();
