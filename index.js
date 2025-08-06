@@ -79,48 +79,21 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
             
             // --- RESTORED EMAIL LOGIC ---
             const transporter = getTransporter();
-
-            const formatLineItem = (item) => {
-                const metadata = item.price && item.price.product ? item.price.product.metadata : {};
-                if (metadata.custom_details) {
-                    const customDetails = JSON.parse(metadata.custom_details);
-                    const customDetailsHtml = Object.entries(customDetails).map(([part, filename]) => `<li>${part}: ${filename}</li>`).join('');
-                    return `<li><b>Item:</b> ${item.description} <br><b>Quantity:</b> ${item.quantity} <br><b>Price:</b> $${(item.amount_total / 100).toFixed(2)} <br><b>Custom Details:</b><ul>${customDetailsHtml}</ul></li>`;
-                } else {
-                    return `<li>${item.quantity} x ${item.description} - $${(item.amount_total / 100).toFixed(2)}</li>`;
-                }
-            };
-
-            const lineItemsHtml = session.line_items.data.map(formatLineItem).join('');
-
+            const lineItemsHtml = session.line_items.data.map(item => `<li>${item.quantity} x ${item.description} - $${(item.amount_total / 100).toFixed(2)}</li>`).join('');
             const customerMailOptions = {
                 from: emailUser,
                 to: customer.email,
                 subject: 'Order Confirmation from Nobilis Crochet',
-                html: `<h1>Thank You for Your Order!</h1><p>Hi ${customer.name || 'Customer'},</p><p>Your order #${session.id.slice(-8)} has been confirmed. We'll send you another email when it ships.</p><p><strong>Order Summary:</strong></p><ul>${lineItemsHtml}</ul><p>Total: $${(session.amount_total / 100).toFixed(2)}</p><p>If you have any questions, please contact us.</p><p>The Nobilis Crochet Team</p>`,
+                html: `<h1>Thank You for Your Order!</h1><p>Hi ${customer.name || 'Customer'},</p><p>Your order #${session.id.slice(-8)} has been confirmed.</p><p><strong>Order Summary:</strong></p><ul>${lineItemsHtml}</ul><p>Total: $${(session.amount_total / 100).toFixed(2)}</p>`,
             };
-
             const ownerMailOptions = {
                 from: emailUser,
                 to: emailRecipient,
                 subject: `NEW ORDER #${session.id.slice(-8)} from ${customer.name || 'Customer'}`,
-                html: `<h1>New Order Received!</h1><p><b>Order ID:</b> ${session.id}</p><p><b>Customer Name:</b> ${customer.name || 'N/A'}</p><p><b>Customer Email:</b> ${customer.email || 'N/A'}</p><hr><h3>Order Details:</h3><ul>${lineItemsHtml}</ul><p><b>Total:</b> $${(session.amount_total / 100).toFixed(2)}</p><hr><h3>Shipping Address:</h3><p>${session.shipping_details ? session.shipping_details.name : 'N/A'}<br>${session.shipping_details ? (session.shipping_details.address.line1 || 'N/A') : ''}${session.shipping_details && session.shipping_details.address.line2 ? '<br>' + session.shipping_details.address.line2 : ''}<br>${session.shipping_details ? (session.shipping_details.address.city || 'N/A') : ''}, ${session.shipping_details ? (session.shipping_details.address.state || 'N/A') : ''} ${session.shipping_details ? (session.shipping_details.address.postal_code || 'N/A') : ''}<br>${session.shipping_details ? (session.shipping_details.address.country || 'N/A') : ''}</p>`,
+                html: `<h1>New Order Received!</h1><p><b>Order ID:</b> ${session.id}</p><p><b>Customer Email:</b> ${customer.email || 'N/A'}</p><hr><h3>Order Details:</h3><ul>${lineItemsHtml}</ul><p><b>Total:</b> $${(session.amount_total / 100).toFixed(2)}</p>`,
             };
-
-            try {
-                await transporter.sendMail(customerMailOptions);
-                console.log('Confirmation email sent to customer.');
-            } catch (emailError) {
-                console.error('Error sending confirmation email to customer:', emailError);
-            }
-
-            try {
-                await transporter.sendMail(ownerMailOptions);
-                console.log('Order notification email sent to owner.');
-            } catch (emailError) {
-                console.error('Error sending order notification email to owner:', emailError);
-            }
-            // --- END OF RESTORED EMAIL LOGIC ---
+            await transporter.sendMail(customerMailOptions);
+            await transporter.sendMail(ownerMailOptions);
 
         } catch (error) {
             console.error('Error processing webhook event:', error);
@@ -153,20 +126,15 @@ passport.use(new GoogleStrategy({
     clientSecret: googleClientSecret,
     callbackURL: `${serverUrl}/auth/google/callback`,
 }, async (accessToken, refreshToken, profile, done) => {
+    const db = getDbPool();
+    const { id: googleId, displayName } = profile;
+    const email = profile.emails[0].value;
     try {
-        const db = getDbPool();
-        const { id: googleId, displayName } = profile;
-        const email = profile.emails[0].value;
         let result = await db.query('SELECT * FROM users WHERE google_id = $1', [googleId]);
-        let user = result.rows[0];
-        if (!user) {
-            const insertResult = await db.query(
-                'INSERT INTO users (google_id, display_name, email) VALUES ($1, $2, $3) RETURNING *',
-                [googleId, displayName, email]
-            );
-            user = insertResult.rows[0];
+        if (result.rows.length === 0) {
+            result = await db.query('INSERT INTO users (google_id, display_name, email) VALUES ($1, $2, $3) RETURNING *', [googleId, displayName, email]);
         }
-        done(null, user);
+        done(null, result.rows[0]);
     } catch (error) {
         done(error);
     }
@@ -174,8 +142,8 @@ passport.use(new GoogleStrategy({
 
 passport.serializeUser((user, done) => done(null, user.id));
 passport.deserializeUser(async (id, done) => {
+    const db = getDbPool();
     try {
-        const db = getDbPool();
         const result = await db.query('SELECT * FROM users WHERE id = $1', [id]);
         done(null, result.rows[0]);
     } catch (error) {
@@ -198,80 +166,79 @@ app.post('/auth/logout', (req, res) => {
     req.logout(() => res.redirect(`${frontendUrl}/`));
 });
 
-app.get('/api/user', (req, res) => {
-    res.status(req.isAuthenticated() ? 200 : 401).json({ user: req.user || null });
-});
+app.get('/api/user', (req, res) => res.json({ user: req.user || null }));
 
 app.get('/api/orders', ensureAuthenticated, async (req, res) => {
+    const db = getDbPool();
     try {
-        const db = getDbPool();
         const result = await db.query('SELECT * FROM orders WHERE customer_email = $1 ORDER BY created_at DESC', [req.user.email]);
         res.json(result.rows);
     } catch (error) {
-        console.error('Error fetching orders:', error);
         res.status(500).json({ error: 'Failed to fetch orders' });
     }
 });
 
 app.get('/api/reviews/:productId', async (req, res) => {
+    const db = getDbPool();
     try {
-        const { productId } = req.params;
-        const db = getDbPool();
-        const result = await db.query('SELECT * FROM reviews WHERE product_id = $1 ORDER BY created_at DESC', [productId]);
+        const result = await db.query('SELECT * FROM reviews WHERE product_id = $1 ORDER BY created_at DESC', [req.params.productId]);
         res.json(result.rows);
     } catch (error) {
-        console.error('Error fetching reviews:', error);
         res.status(500).json({ error: 'Failed to fetch reviews' });
     }
 });
 
 app.post('/api/reviews', ensureAuthenticated, async (req, res) => {
+    const db = getDbPool();
+    const { productId, rating, comment } = req.body;
+    const { google_id: userId, display_name: userName } = req.user;
     try {
-        const { productId, rating, comment } = req.body;
-        const { google_id: userId, display_name: userName } = req.user;
-        const db = getDbPool();
         const result = await db.query(
             'INSERT INTO reviews (product_id, user_id, user_name, rating, comment) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (product_id, user_id) DO UPDATE SET rating = EXCLUDED.rating, comment = EXCLUDED.comment, created_at = NOW() RETURNING *',
             [productId, userId, userName, rating, comment]
         );
         res.status(201).json(result.rows[0]);
     } catch (error) {
-        console.error('Error posting review:', error);
         res.status(500).json({ error: 'Failed to post review' });
     }
 });
 
-app.get('/api/user/has-purchased/:productId', ensureAuthenticated, async (req, res) => {
+// NEW: Route to verify an order by ID for leaving a review
+app.post('/api/verify-order-for-review', ensureAuthenticated, async (req, res) => {
+    const { orderId, productId } = req.body;
+    const { email: userEmail } = req.user;
+    const db = getDbPool();
+
     try {
-        const { productId } = req.params;
-        const { email: userEmail } = req.user;
-        const db = getDbPool();
-        const ordersResult = await db.query('SELECT line_items FROM orders WHERE customer_email = $1', [userEmail]);
+        const orderResult = await db.query('SELECT * FROM orders WHERE order_id = $1', [orderId]);
 
-        if (ordersResult.rows.length === 0) {
-            return res.json({ hasPurchased: false });
+        if (orderResult.rows.length === 0) {
+            return res.status(404).json({ verified: false, message: 'Order not found.' });
         }
 
-        let hasPurchased = false;
-        for (const order of ordersResult.rows) {
-            const lineItems = JSON.parse(order.line_items);
-            if (Array.isArray(lineItems)) {
-                for (const item of lineItems) {
-                    const metadataProductId = item.price?.product?.metadata?.productId;
-                    if (String(metadataProductId) === String(productId)) {
-                        hasPurchased = true;
-                        break;
-                    }
-                }
-            }
-            if (hasPurchased) break;
+        const order = orderResult.rows[0];
+
+        if (order.customer_email !== userEmail) {
+            return res.status(403).json({ verified: false, message: 'This order does not belong to you.' });
         }
-        res.json({ hasPurchased });
+
+        const lineItems = JSON.parse(order.line_items);
+        const hasPurchased = lineItems.some(item => 
+            String(item.price?.product?.metadata?.productId) === String(productId)
+        );
+
+        if (!hasPurchased) {
+            return res.status(400).json({ verified: false, message: 'This order does not contain the specified product.' });
+        }
+
+        res.json({ verified: true });
+
     } catch (error) {
-        console.error('Error checking purchase history:', error);
-        res.status(500).json({ error: 'Failed to check purchase history' });
+        console.error('Error verifying order for review:', error);
+        res.status(500).json({ verified: false, message: 'An internal error occurred.' });
     }
 });
+
 
 app.post('/create-checkout-session', async (req, res) => {
     const stripe = getStripe();
@@ -300,7 +267,6 @@ app.post('/create-checkout-session', async (req, res) => {
         });
         res.json({ url: session.url });
     } catch (error) {
-        console.error('Error creating checkout session:', error);
         res.status(500).json({ error: 'Failed to create checkout session' });
     }
 });
