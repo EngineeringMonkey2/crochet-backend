@@ -87,8 +87,7 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
             );
             console.log('Order saved to database:', result.rows[0].order_id);
 
-            // Email logic follows...
-            // (No changes needed to email logic)
+            // Email logic can be added here if needed
 
         } catch (error) {
             console.error('Error processing webhook event (database/email):', error);
@@ -99,14 +98,24 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
 });
 
 app.use(express.json());
+// IMPORTANT: Trust the proxy to handle secure cookies correctly
+app.set('trust proxy', 1); 
 app.use(cors({ origin: frontendUrl, credentials: true }));
+
+// UPDATED: Session middleware with correct cookie settings for cross-domain auth
 app.use(session({
     store: new PgSession({ pool: getDbPool(), tableName: 'sessions' }),
     secret: sessionSecret,
     resave: false,
     saveUninitialized: false,
-    cookie: { secure: process.env.NODE_ENV === 'production', maxAge: 24 * 60 * 60 * 1000 }
+    cookie: {
+        secure: true, // Must be true since we are setting sameSite='none'
+        sameSite: 'none', // Allow cookie to be sent from frontend domain to backend domain
+        httpOnly: true, // Helps prevent XSS attacks
+        maxAge: 24 * 60 * 60 * 1000 // 24-hour session
+    }
 }));
+
 app.use(passport.initialize());
 app.use(passport.session());
 
@@ -173,7 +182,6 @@ app.get('/auth/google/callback', passport.authenticate('google', {
 app.post('/auth/logout', (req, res, next) => {
     req.logout(function(err) {
         if (err) { return next(err); }
-        // Redirect to the homepage after logout
         res.redirect(`${frontendUrl}/`);
     });
 });
@@ -229,7 +237,6 @@ app.post('/api/reviews', ensureAuthenticated, async (req, res) => {
     }
 });
 
-// NEW: Route to check if a user has purchased a specific product
 app.get('/api/user/has-purchased/:productId', ensureAuthenticated, async (req, res) => {
     try {
         const { productId } = req.params;
@@ -244,11 +251,9 @@ app.get('/api/user/has-purchased/:productId', ensureAuthenticated, async (req, r
 
         let hasPurchased = false;
         for (const order of ordersResult.rows) {
-            // The line_items from the DB are stored as a JSON string
             const lineItems = order.line_items; 
             if (lineItems && Array.isArray(lineItems)) {
                 for (const item of lineItems) {
-                    // Check the metadata attached to the Stripe product object
                     if (String(item.price?.product?.metadata?.productId) === String(productId)) {
                         hasPurchased = true;
                         break;
@@ -276,7 +281,6 @@ app.post('/create-checkout-session', async (req, res) => {
             name: item.name,
             images: item.image ? [item.image] : undefined,
             metadata: {
-                // IMPORTANT: Add the product ID from your database to the metadata
                 productId: item.id 
             }
         };
@@ -317,7 +321,6 @@ app.post('/create-checkout-session', async (req, res) => {
     }
 });
 
-// (No changes to /order-details route)
 app.get('/order-details', async (req, res) => {
     const stripe = getStripe();
     try {
