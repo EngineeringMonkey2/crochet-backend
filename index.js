@@ -30,17 +30,17 @@ const frontendUrl = process.env.FRONTEND_URL || 'https://nobiliscrochet.com';
 // --- LAZY INITIALIZATION & DB POOL ---
 let stripeInstance, transporter, dbPool;
 function getStripe() { if (!stripeInstance) { stripeInstance = stripe(stripeSecretKey); } return stripeInstance; }
-function getTransporter() { 
+function getTransporter() {
     if (!transporter) {
         // Log a message to ensure the transporter is being created
         console.log("Attempting to create email transporter...");
-        transporter = nodemailer.createTransport({ 
-            service: 'gmail', 
-            auth: { user: emailUser, pass: emailPass } 
+        transporter = nodemailer.createTransport({
+            service: 'gmail',
+            auth: { user: emailUser, pass: emailPass }
         });
         console.log("Email transporter created.");
     }
-    return transporter; 
+    return transporter;
 }
 function getDbPool() {
     if (!dbPool) {
@@ -74,13 +74,13 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
     // Handle the event
     if (event.type === 'checkout.session.completed') {
         const checkoutSession = event.data.object;
-        
+
         try {
             // FIX: Correctly expand the product details to get the metadata
             session = await stripe.checkout.sessions.retrieve(checkoutSession.id, {
                 expand: ['line_items.data.price.product', 'customer'],
             });
-            
+
             if (session.customer && typeof session.customer === 'object') {
                 customer = session.customer;
             } else if (session.customer) {
@@ -88,7 +88,7 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
             } else {
                 customer = { email: checkoutSession.customer_details.email, name: checkoutSession.customer_details.name || 'Customer' };
             }
-            
+
             console.log('Checkout Session completed:', session.id);
 
             // First, save the order to the database
@@ -108,8 +108,8 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
                 const metadata = item.price && item.price.product ? item.price.product.metadata : {};
                 if (metadata.custom_details) {
                     const customDetails = JSON.parse(metadata.custom_details);
-                    
-                    const customDetailsHtml = Object.entries(customDetails).map(([part, filename]) => 
+
+                    const customDetailsHtml = Object.entries(customDetails).map(([part, filename]) =>
                         `<li>${part}: ${filename}</li>`
                     ).join('');
 
@@ -129,7 +129,7 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
                     return `<li>${item.quantity} x ${item.description} - $${(item.amount_total / 100).toFixed(2)}</li>`;
                 }
             };
-            
+
             // Map all line items to a formatted HTML string
             const lineItemsHtml = session.line_items.data.map(formatLineItem).join('');
 
@@ -191,7 +191,7 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
             console.error('Error processing webhook event (database/email):', error);
         }
     }
-    
+
     res.sendStatus(200);
 });
 
@@ -216,39 +216,80 @@ passport.use(new GoogleStrategy({
 }, async (accessToken, refreshToken, profile, done) => {
     try {
         const db = getDbPool();
-        const user = {
-            id: profile.id,
-            display_name: profile.displayName,
-            email: profile.emails[0].value,
-        };
-        // Check if user exists
-        let result = await db.query('SELECT * FROM users WHERE id = $1', [user.id]);
+        const googleId = profile.id;
+        const displayName = profile.displayName;
+        const email = profile.emails[0].value;
+
+        // Check if user exists using the correct google_id column
+        let result = await db.query('SELECT * FROM users WHERE google_id = $1', [googleId]);
+
+        let user;
         if (result.rows.length === 0) {
-            // New user, insert into database
-            await db.query('INSERT INTO users (id, display_name, email) VALUES ($1, $2, $3)',
-                [user.id, user.display_name, user.email]);
+            // New user, insert into database using the correct columns
+            const insertResult = await db.query(
+                'INSERT INTO users (google_id, display_name, email) VALUES ($1, $2, $3) RETURNING *',
+                [googleId, displayName, email]
+            );
+            user = insertResult.rows[0];
+        } else {
+            // Existing user
+            user = result.rows[0];
         }
+        // The 'done' callback expects the full user object from our database
         done(null, user);
     } catch (error) {
         done(error);
     }
 }));
-passport.serializeUser((user, done) => done(null, user.id));
+
+// Serialize user by storing their database primary key 'id' in the session
+passport.serializeUser((user, done) => {
+    done(null, user.id);
+});
+
+// Deserialize user by fetching their full profile from the database using the primary key 'id'
 passport.deserializeUser(async (id, done) => {
     try {
         const db = getDbPool();
         const result = await db.query('SELECT * FROM users WHERE id = $1', [id]);
-        done(null, result.rows[0]);
+        if (result.rows.length > 0) {
+            done(null, result.rows[0]);
+        } else {
+            done(new Error('User not found'));
+        }
     } catch (error) {
         done(error);
     }
 });
+
 const ensureAuthenticated = (req, res, next) => {
     if (req.isAuthenticated()) { return next(); }
     res.status(401).json({ message: 'Authentication required' });
 };
 
-// --- ROUTES ---
+// --- AUTH ROUTES ---
+
+// This route starts the Google login process
+app.get('/auth/google', passport.authenticate('google', {
+    scope: ['profile', 'email'] // Specifies what information to request from Google
+}));
+
+// This is the callback route that Google redirects to after a successful login
+app.get('/auth/google/callback', passport.authenticate('google', {
+    failureRedirect: `${frontendUrl}/login.html?error=true`, // Redirect on failure
+    successRedirect: `${frontendUrl}/account.html`, // Redirect on success
+}));
+
+// This route handles user logout
+app.post('/auth/logout', (req, res, next) => {
+    req.logout(function(err) {
+        if (err) { return next(err); }
+        res.redirect('/');
+    });
+});
+
+
+// --- API ROUTES ---
 
 // GET user info
 app.get('/api/user', (req, res) => {
@@ -258,6 +299,20 @@ app.get('/api/user', (req, res) => {
         res.status(401).json({ user: null });
     }
 });
+
+// GET all orders for the logged-in user
+app.get('/api/orders', ensureAuthenticated, async (req, res) => {
+    try {
+        const db = getDbPool();
+        // req.user.email is available because the user is authenticated
+        const result = await db.query('SELECT * FROM orders WHERE customer_email = $1 ORDER BY created_at DESC', [req.user.email]);
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Error fetching orders:', error);
+        res.status(500).json({ error: 'Failed to fetch orders' });
+    }
+});
+
 
 // GET all reviews for a product
 app.get('/api/reviews/:productId', async (req, res) => {
@@ -276,11 +331,13 @@ app.get('/api/reviews/:productId', async (req, res) => {
 app.post('/api/reviews', ensureAuthenticated, async (req, res) => {
     try {
         const { productId, rating, comment } = req.body;
-        const { id: userId, display_name: userName } = req.user;
-        
+        // Use the authenticated user's details from req.user
+        const userId = req.user.google_id;
+        const userName = req.user.display_name;
+
         const db = getDbPool();
         const result = await db.query(
-            'INSERT INTO reviews (product_id, user_id, user_name, rating, comment) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+            'INSERT INTO reviews (product_id, user_id, user_name, rating, comment) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (product_id, user_id) DO UPDATE SET rating = EXCLUDED.rating, comment = EXCLUDED.comment, created_at = NOW() RETURNING *',
             [productId, userId, userName, rating, comment]
         );
         res.status(201).json(result.rows[0]);
@@ -296,7 +353,7 @@ app.post('/api/reviews', ensureAuthenticated, async (req, res) => {
 app.post('/create-checkout-session', async (req, res) => {
     const stripe = getStripe();
     const { cart } = req.body;
-    
+
     // Convert cart items to Stripe line item format
     const lineItems = cart.map(item => {
         // Prepare the product data
@@ -304,7 +361,7 @@ app.post('/create-checkout-session', async (req, res) => {
             name: item.name,
             images: item.image ? [item.image] : undefined
         };
-        
+
         if (item.name === 'Custom Monkey' && item.images) {
             const shortImages = {};
             for (const part in item.images) {
@@ -320,7 +377,6 @@ app.post('/create-checkout-session', async (req, res) => {
             price_data: {
                 currency: 'usd',
                 product_data: productData,
-                // FIX: Corrected syntax error in this line
                 unit_amount: Math.round(parseFloat(item.price.replace('$', '')) * 100), // Stripe expects cents
             },
             quantity: item.quantity,
@@ -334,11 +390,7 @@ app.post('/create-checkout-session', async (req, res) => {
             mode: 'payment',
             success_url: `${frontendUrl}/receipt.html?session_id={CHECKOUT_SESSION_ID}`,
             cancel_url: `${frontendUrl}/cancel.html`,
-            
-            // NEW: Enforce shipping address collection
             shipping_address_collection: {
-                // You can add more countries here as needed
-                // For example: allowed_countries: ['US', 'CA', 'GB']
                 allowed_countries: ['US'],
             },
         });
@@ -357,7 +409,7 @@ app.get('/order-details', async (req, res) => {
         if (!session_id) {
             return res.status(400).json({ error: 'Session ID is required.' });
         }
-        
+
         const session = await stripe.checkout.sessions.retrieve(session_id, {
             expand: ['line_items'],
         });
@@ -369,7 +421,7 @@ app.get('/order-details', async (req, res) => {
             amount_total: item.amount_total / 100,
             metadata: item.price.product.metadata ? item.price.product.metadata : {},
         }));
-        
+
         res.json({
             id: session.id,
             amount_total: session.amount_total / 100,
@@ -392,4 +444,3 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`Server is listening on port ${PORT}`);
 });
-//this one is the working one
