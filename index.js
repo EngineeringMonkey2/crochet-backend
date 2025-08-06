@@ -59,7 +59,6 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
 
     try {
         event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
-        console.log('Webhook received:', event.type);
     } catch (err) {
         console.error(`Webhook signature verification failed:`, err.message);
         return res.sendStatus(400);
@@ -74,16 +73,13 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
             const customer = session.customer ? session.customer : { email: checkoutSession.customer_details.email, name: checkoutSession.customer_details.name || 'Customer' };
             const db = getDbPool();
             
-            // MERGED: Calculate total items for review credits
             const totalItems = session.line_items.data.reduce((sum, item) => sum + item.quantity, 0);
 
-            // MERGED: Add review_uses_remaining to the database insert
             await db.query(
                 'INSERT INTO orders (order_id, amount_total, customer_email, line_items, review_uses_remaining) VALUES ($1, $2, $3, $4, $5) RETURNING *',
                 [session.id, session.amount_total / 100, customer.email, JSON.stringify(session.line_items.data), totalItems]
             );
 
-            // PRESERVED: Your working email logic
             const transporter = getTransporter();
             const formatLineItem = (item) => {
                 const metadata = item.price && item.price.product ? item.price.product.metadata : {};
@@ -197,20 +193,44 @@ app.get('/api/reviews/:productId', async (req, res) => {
     }
 });
 
+// UPDATED: Review verification route with detailed logging
 app.post('/api/verify-order-for-review', ensureAuthenticated, async (req, res) => {
     const { orderId, productId } = req.body;
     const { email: userEmail, google_id: userId } = req.user;
     const db = getDbPool();
+
+    console.log(`--- Review Verification Attempt ---`);
+    console.log(`User: ${userEmail}, Order ID: ${orderId}, Product ID: ${productId}`);
+
     try {
         const orderResult = await db.query("SELECT * FROM orders WHERE order_id = $1 OR order_id LIKE '%' || $1", [orderId]);
-        if (orderResult.rows.length === 0) return res.status(404).json({ verified: false, message: 'Order not found.' });
+        if (orderResult.rows.length === 0) {
+            console.log(`Verification FAILED: Order ID "${orderId}" not found in database.`);
+            return res.status(404).json({ verified: false, message: 'Order not found.' });
+        }
+        
         const order = orderResult.rows[0];
-        if (order.customer_email !== userEmail) return res.status(403).json({ verified: false, message: 'This order does not belong to you.' });
-        if (order.review_uses_remaining <= 0) return res.status(400).json({ verified: false, message: 'All reviews for this order have been used.' });
+        console.log(`Order found: ${order.order_id} with ${order.review_uses_remaining} reviews remaining.`);
+
+        if (order.customer_email !== userEmail) {
+            console.log(`Verification FAILED: Order email (${order.customer_email}) does not match user email (${userEmail}).`);
+            return res.status(403).json({ verified: false, message: 'This order does not belong to you.' });
+        }
+        if (order.review_uses_remaining <= 0) {
+            console.log(`Verification FAILED: Order has no review credits left.`);
+            return res.status(400).json({ verified: false, message: 'All reviews for this order have been used.' });
+        }
+        
         const reviewResult = await db.query('SELECT * FROM reviews WHERE user_id = $1 AND product_id = $2', [userId, productId]);
-        if (reviewResult.rows.length > 0) return res.status(400).json({ verified: false, message: 'You have already reviewed this product.' });
+        if (reviewResult.rows.length > 0) {
+            console.log(`Verification FAILED: User has already reviewed product ${productId}.`);
+            return res.status(400).json({ verified: false, message: 'You have already reviewed this product.' });
+        }
+        
+        console.log(`Verification SUCCESSFUL for user ${userEmail} and order ${order.order_id}.`);
         res.json({ verified: true });
     } catch (error) {
+        console.error('Error verifying order for review:', error);
         res.status(500).json({ verified: false, message: 'An internal error occurred.' });
     }
 });
@@ -220,7 +240,9 @@ app.post('/api/reviews', ensureAuthenticated, async (req, res) => {
     const { email: userEmail, google_id: userId } = req.user;
     const db = getDbPool();
     const client = await db.connect();
+    
     let finalUserName = userName && userName.trim() ? userName.trim() : 'Anonymous';
+
     try {
         await client.query('BEGIN');
         const orderResult = await client.query("SELECT * FROM orders WHERE order_id = $1 OR order_id LIKE '%' || $1 FOR UPDATE", [orderId]);
@@ -230,15 +252,20 @@ app.post('/api/reviews', ensureAuthenticated, async (req, res) => {
         if (order.review_uses_remaining <= 0) throw new Error('All reviews for this order have been used.');
         const reviewResult = await client.query('SELECT * FROM reviews WHERE user_id = $1 AND product_id = $2', [userId, productId]);
         if (reviewResult.rows.length > 0) throw new Error('You have already reviewed this product.');
+        
         const insertReviewResult = await client.query(
             'INSERT INTO reviews (product_id, user_id, user_name, rating, comment, order_id_used) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
             [productId, userId, finalUserName, rating, comment, order.order_id]
         );
-        await client.query('UPDATE orders SET review_uses_remaining = review_uses_remaining - 1 WHERE order_id = $1', [order.order_id]);
+        await client.query(
+            'UPDATE orders SET review_uses_remaining = review_uses_remaining - 1 WHERE order_id = $1',
+            [order.order_id]
+        );
         await client.query('COMMIT');
         res.status(201).json(insertReviewResult.rows[0]);
     } catch (error) {
         await client.query('ROLLBACK');
+        console.error('Error posting review:', error);
         res.status(500).json({ error: error.message || 'Failed to post review' });
     } finally {
         client.release();
@@ -247,20 +274,20 @@ app.post('/api/reviews', ensureAuthenticated, async (req, res) => {
 
 app.put('/api/reviews/:reviewId', ensureAuthenticated, async (req, res) => {
     const { reviewId } = req.params;
-    const { rating, comment, userName } = req.body;
+    const { rating, comment } = req.body;
     const { google_id: userId } = req.user;
     const db = getDbPool();
-    let finalUserName = userName && userName.trim() ? userName.trim() : 'Anonymous';
     try {
         const result = await db.query(
-            'UPDATE reviews SET rating = $1, comment = $2, user_name = $3, created_at = NOW() WHERE id = $4 AND user_id = $5 RETURNING *',
-            [rating, comment, finalUserName, reviewId, userId]
+            'UPDATE reviews SET rating = $1, comment = $2, created_at = NOW() WHERE id = $3 AND user_id = $4 RETURNING *',
+            [rating, comment, reviewId, userId]
         );
         if (result.rows.length === 0) {
             return res.status(403).json({ error: 'You are not authorized to edit this review.' });
         }
         res.json(result.rows[0]);
     } catch (error) {
+        console.error('Error updating review:', error);
         res.status(500).json({ error: 'Failed to update review.' });
     }
 });
@@ -273,7 +300,9 @@ app.delete('/api/reviews/:reviewId', ensureAuthenticated, async (req, res) => {
     try {
         await client.query('BEGIN');
         const reviewResult = await client.query('SELECT * FROM reviews WHERE id = $1 AND user_id = $2', [reviewId, userId]);
-        if (reviewResult.rows.length === 0) throw new Error('Review not found or you are not authorized to delete it.');
+        if (reviewResult.rows.length === 0) {
+            throw new Error('Review not found or you are not authorized to delete it.');
+        }
         const orderIdUsed = reviewResult.rows[0].order_id_used;
         await client.query('DELETE FROM reviews WHERE id = $1', [reviewId]);
         if (orderIdUsed) {
@@ -283,6 +312,7 @@ app.delete('/api/reviews/:reviewId', ensureAuthenticated, async (req, res) => {
         res.status(204).send();
     } catch (error) {
         await client.query('ROLLBACK');
+        console.error('Error deleting review:', error);
         res.status(500).json({ error: error.message || 'Failed to delete review.' });
     } finally {
         client.release();
