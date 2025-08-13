@@ -69,16 +69,24 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
         const checkoutSession = event.data.object;
         try {
             const session = await stripe.checkout.sessions.retrieve(checkoutSession.id, {
-                expand: ['line_items.data.price.product', 'customer'],
+                expand: ['line_items.data.price.product', 'customer', 'shipping_cost.shipping_rate'],
             });
             const customer = session.customer ? session.customer : { email: checkoutSession.customer_details.email, name: checkoutSession.customer_details.name || 'Customer' };
             const db = getDbPool();
             
             const totalItems = session.line_items.data.reduce((sum, item) => sum + item.quantity, 0);
 
+            // Store the order in the database
             await db.query(
-                'INSERT INTO orders (order_id, amount_total, customer_email, line_items, review_uses_remaining) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-                [session.id, session.amount_total / 100, customer.email, JSON.stringify(session.line_items.data), totalItems]
+                'INSERT INTO orders (order_id, amount_total, customer_email, line_items, review_uses_remaining, shipping_cost) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+                [
+                    session.id, 
+                    session.amount_total / 100, 
+                    customer.email, 
+                    JSON.stringify(session.line_items.data), 
+                    totalItems,
+                    session.shipping_cost ? JSON.stringify(session.shipping_cost) : null
+                ]
             );
 
             const transporter = getTransporter();
@@ -93,13 +101,15 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
                 }
             };
             const lineItemsHtml = session.line_items.data.map(formatLineItem).join('');
+            const shippingHtml = session.shipping_cost ? `<p>Shipping: $${(session.shipping_cost.amount_total / 100).toFixed(2)}</p>` : '';
+            
             const customerMailOptions = {
                 from: emailUser, to: customer.email, subject: 'Order Confirmation from Nobilis Crochet',
-                html: `<h1>Thank You for Your Order!</h1><p>Hi ${customer.name || 'Customer'},</p><p>Your order #${session.id.slice(-8)} has been confirmed. We'll send you another email when it ships.</p><p><strong>Order Summary:</strong></p><ul>${lineItemsHtml}</ul><p>Total: $${(session.amount_total / 100).toFixed(2)}</p><p>If you have any questions, please contact us.</p><p>The Nobilis Crochet Team</p>`,
+                html: `<h1>Thank You for Your Order!</h1><p>Hi ${customer.name || 'Customer'},</p><p>Your order #${session.id.slice(-8)} has been confirmed. We'll send you another email when it ships.</p><p><strong>Order Summary:</strong></p><ul>${lineItemsHtml}</ul>${shippingHtml}<p>Total: $${(session.amount_total / 100).toFixed(2)}</p><p>If you have any questions, please contact us.</p><p>The Nobilis Crochet Team</p>`,
             };
             const ownerMailOptions = {
                 from: emailUser, to: emailRecipient, subject: `NEW ORDER #${session.id.slice(-8)} from ${customer.name || 'Customer'}`,
-                html: `<h1>New Order Received!</h1><p><b>Order ID:</b> ${session.id}</p><p><b>Customer Name:</b> ${customer.name || 'N/A'}</p><p><b>Customer Email:</b> ${customer.email || 'N/A'}</p><hr><h3>Order Details:</h3><ul>${lineItemsHtml}</ul><p><b>Total:</b> $${(session.amount_total / 100).toFixed(2)}</p><hr><h3>Shipping Address:</h3><p>${session.shipping_details ? session.shipping_details.name : 'N/A'}<br>${session.shipping_details ? (session.shipping_details.address.line1 || 'N/A') : ''}${session.shipping_details && session.shipping_details.address.line2 ? '<br>' + session.shipping_details.address.line2 : ''}<br>${session.shipping_details ? (session.shipping_details.address.city || 'N/A') : ''}, ${session.shipping_details ? (session.shipping_details.address.state || 'N/A') : ''} ${session.shipping_details ? (session.shipping_details.address.postal_code || 'N/A') : ''}<br>${session.shipping_details ? (session.shipping_details.address.country || 'N/A') : ''}</p>`,
+                html: `<h1>New Order Received!</h1><p><b>Order ID:</b> ${session.id}</p><p><b>Customer Name:</b> ${customer.name || 'N/A'}</p><p><b>Customer Email:</b> ${customer.email || 'N/A'}</p><hr><h3>Order Details:</h3><ul>${lineItemsHtml}</ul>${shippingHtml}<p><b>Total:</b> $${(session.amount_total / 100).toFixed(2)}</p><hr><h3>Shipping Address:</h3><p>${session.shipping_details ? session.shipping_details.name : 'N/A'}<br>${session.shipping_details ? (session.shipping_details.address.line1 || 'N/A') : ''}${session.shipping_details && session.shipping_details.address.line2 ? '<br>' + session.shipping_details.address.line2 : ''}<br>${session.shipping_details ? (session.shipping_details.address.city || 'N/A') : ''}, ${session.shipping_details ? (session.shipping_details.address.state || 'N/A') : ''} ${session.shipping_details ? (session.shipping_details.address.postal_code || 'N/A') : ''}<br>${session.shipping_details ? (session.shipping_details.address.country || 'N/A') : ''}</p>`,
             };
             await transporter.sendMail(customerMailOptions);
             await transporter.sendMail(ownerMailOptions);
@@ -286,9 +296,12 @@ app.delete('/api/reviews/:reviewId', ensureAuthenticated, async (req, res) => {
     }
 });
 
+// --- UPDATED CHECKOUT ROUTE ---
 app.post('/create-checkout-session', async (req, res) => {
     const stripe = getStripe();
-    const { cart } = req.body;
+    // Destructure both cart and shippingFee from the request body
+    const { cart, shippingFee } = req.body; 
+
     const lineItems = cart.map(item => {
         const productData = { name: item.name, images: item.image ? [item.image] : undefined, metadata: { productId: item.id } };
         if (item.name === 'Custom Monkey' && item.images) {
@@ -301,38 +314,75 @@ app.post('/create-checkout-session', async (req, res) => {
             quantity: item.quantity,
         };
     });
+
+    // Base configuration for the Stripe session
+    const sessionConfig = {
+        payment_method_types: ['card'],
+        line_items: lineItems,
+        mode: 'payment',
+        automatic_tax: {
+            enabled: true,
+        },
+        success_url: `${frontendUrl}/receipt.html?session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${frontendUrl}/cancel.html`,
+        shipping_address_collection: { allowed_countries: ['US'] },
+    };
+
+    // If a shipping fee was passed from the frontend, add it to the session
+    if (shippingFee && shippingFee > 0) {
+        sessionConfig.shipping_options = [
+            {
+                shipping_rate_data: {
+                    type: 'fixed_amount',
+                    fixed_amount: {
+                        amount: Math.round(shippingFee * 100), // Convert to cents
+                        currency: 'usd',
+                    },
+                    display_name: 'Standard Shipping',
+                    // delivery_estimate: {
+                    //     minimum: { unit: 'business_day', value: 5 },
+                    //     maximum: { unit: 'business_day', value: 7 },
+                    // },
+                },
+            },
+        ];
+    }
+
     try {
-        const session = await stripe.checkout.sessions.create({
-            payment_method_types: ['card'], line_items: lineItems, mode: 'payment',
-			
-            automatic_tax: {
-                enabled: true,
-            },			
-			
-            success_url: `${frontendUrl}/receipt.html?session_id={CHECKOUT_SESSION_ID}`,
-            cancel_url: `${frontendUrl}/cancel.html`,
-            shipping_address_collection: { allowed_countries: ['US'] },
-        });
+        // Create the session with the final configuration
+        const session = await stripe.checkout.sessions.create(sessionConfig);
         res.json({ url: session.url });
     } catch (error) {
+        console.error("Stripe session creation error:", error);
         res.status(500).json({ error: 'Failed to create checkout session' });
     }
 });
+
 
 app.get('/order-details', async (req, res) => {
     const stripe = getStripe();
     try {
         const { session_id } = req.query;
         if (!session_id) return res.status(400).json({ error: 'Session ID is required.' });
-        const session = await stripe.checkout.sessions.retrieve(session_id, { expand: ['line_items.data.price.product'] });
+        // Also expand the shipping_cost and shipping_rate
+        const session = await stripe.checkout.sessions.retrieve(session_id, { 
+            expand: ['line_items.data.price.product', 'shipping_cost.shipping_rate'] 
+        });
         res.json({
-            id: session.id, amount_total: session.amount_total / 100, shipping_details: session.shipping_details,
+            id: session.id,
+            amount_total: session.amount_total / 100,
+            amount_subtotal: session.amount_subtotal, // send subtotal in cents
+            total_details: session.total_details, // send tax info
+            shipping_details: session.shipping_details,
+            shipping_cost: session.shipping_cost, // send shipping cost object
             line_items: session.line_items.data,
         });
     } catch (error) {
+        console.error("Order details fetch error:", error);
         res.status(500).json({ error: 'Failed to fetch order details.' });
     }
 });
+
 
 // --- SERVER LISTENER ---
 const PORT = process.env.PORT || 3000;
