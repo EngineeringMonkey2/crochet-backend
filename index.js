@@ -77,15 +77,18 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
             const totalItems = session.line_items.data.reduce((sum, item) => sum + item.quantity, 0);
 
             // Store the order in the database
+            // FIX: Removed the 'shipping_cost' column from the INSERT statement.
+            // The error log indicates this column does not exist in your 'orders' table.
+            // If you want to store this data, you'll need to add the column to your database.
+            // You can do this with a SQL command like: ALTER TABLE orders ADD COLUMN shipping_cost JSONB;
             await db.query(
-                'INSERT INTO orders (order_id, amount_total, customer_email, line_items, review_uses_remaining, shipping_cost) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+                'INSERT INTO orders (order_id, amount_total, customer_email, line_items, review_uses_remaining) VALUES ($1, $2, $3, $4, $5) RETURNING *',
                 [
                     session.id, 
                     session.amount_total / 100, 
                     customer.email, 
                     JSON.stringify(session.line_items.data), 
-                    totalItems,
-                    session.shipping_cost ? JSON.stringify(session.shipping_cost) : null
+                    totalItems
                 ]
             );
 
@@ -368,13 +371,16 @@ app.get('/order-details', async (req, res) => {
         const session = await stripe.checkout.sessions.retrieve(session_id, { 
             expand: ['line_items.data.price.product', 'shipping_cost.shipping_rate'] 
         });
+        // FIX: Send all amounts in cents to the frontend for consistency.
+        // The frontend (receipt.html) already correctly divides by 100.
+        // This fixes the bug where the total was being divided by 100 twice.
         res.json({
             id: session.id,
-            amount_total: session.amount_total / 100,
-            amount_subtotal: session.amount_subtotal, // send subtotal in cents
-            total_details: session.total_details, // send tax info
+            amount_total: session.amount_total,
+            amount_subtotal: session.amount_subtotal,
+            total_details: session.total_details,
             shipping_details: session.shipping_details,
-            shipping_cost: session.shipping_cost, // send shipping cost object
+            shipping_cost: session.shipping_cost,
             line_items: session.line_items.data,
         });
     } catch (error) {
