@@ -313,7 +313,12 @@ app.post('/create-checkout-session', async (req, res) => {
             productData.metadata.custom_details = JSON.stringify(shortImages);
         }
         return {
-            price_data: { currency: 'usd', product_data: productData, unit_amount: Math.round(parseFloat(item.price.replace('$', '')) * 100) },
+            price_data: {
+				currency: 'usd',
+				product_data: productData,
+				unit_amount: Math.round(parseFloat(item.price.replace('$', '')) * 100),
+				tax_behavior: 'exclusive'
+			},
             quantity: item.quantity,
         };
     });
