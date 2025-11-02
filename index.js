@@ -25,7 +25,12 @@ const googleClientId = process.env.GOOGLE_CLIENT_ID;
 const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET;
 const sessionSecret = process.env.SESSION_SECRET;
 const serverUrl = process.env.RENDER_EXTERNAL_URL;
-const frontendUrl = process.env.FRONTEND_URL || 'https://yobilis.com';
+const frontendOriginsRaw = process.env.FRONTEND_URLS || process.env.FRONTEND_URL || 'https://yobilis.com';
+const allowedOrigins = frontendOriginsRaw
+    .split(',')
+    .map(origin => origin.trim())
+    .filter(origin => origin.length > 0);
+const frontendUrl = allowedOrigins[0] || 'https://yobilis.com';
 
 // --- LAZY INITIALIZATION & DB POOL ---
 let stripeInstance, transporter, dbPool;
@@ -125,7 +130,16 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
 
 app.use(express.json());
 app.set('trust proxy', 1);
-app.use(cors({ origin: frontendUrl, credentials: true }));
+app.use(cors({
+    origin: (origin, callback) => {
+        if (!origin || allowedOrigins.includes(origin)) {
+            return callback(null, true);
+        }
+        console.warn(`Blocked CORS origin: ${origin}`);
+        return callback(new Error('Not allowed by CORS'));
+    },
+    credentials: true,
+}));
 app.use(session({
     store: new PgSession({ pool: getDbPool(), tableName: 'sessions' }),
     secret: sessionSecret,
