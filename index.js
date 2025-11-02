@@ -25,7 +25,7 @@ const googleClientId = process.env.GOOGLE_CLIENT_ID;
 const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET;
 const sessionSecret = process.env.SESSION_SECRET;
 const serverUrl = process.env.RENDER_EXTERNAL_URL;
-const frontendUrl = process.env.FRONTEND_URL || 'https://nobiliscrochet.com';
+const frontendUrl = process.env.FRONTEND_URL || 'https://yobilis.com';
 
 // --- LAZY INITIALIZATION & DB POOL ---
 let stripeInstance, transporter, dbPool;
@@ -107,8 +107,8 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
             const shippingHtml = session.shipping_cost ? `<p>Shipping: $${(session.shipping_cost.amount_total / 100).toFixed(2)}</p>` : '';
             
             const customerMailOptions = {
-                from: emailUser, to: customer.email, subject: 'Order Confirmation from Nobilis Crochet',
-                html: `<h1>Thank You for Your Order!</h1><p>Hi ${customer.name || 'Customer'},</p><p>Your order #${session.id.slice(-8)} has been confirmed. We'll send you another email when it ships.</p><p><strong>Order Summary:</strong></p><ul>${lineItemsHtml}</ul>${shippingHtml}<p>Total: $${(session.amount_total / 100).toFixed(2)}</p><p>If you have any questions, please contact us.</p><p>The Nobilis Crochet Team</p>`,
+                from: emailUser, to: customer.email, subject: 'Order Confirmation from Yobilis',
+                html: `<h1>Thank You for Your Order!</h1><p>Hi ${customer.name || 'Customer'},</p><p>Your order #${session.id.slice(-8)} has been confirmed. We'll send you another email when it ships.</p><p><strong>Order Summary:</strong></p><ul>${lineItemsHtml}</ul>${shippingHtml}<p>Total: $${(session.amount_total / 100).toFixed(2)}</p><p>If you have any questions, please contact us.</p><p>The Yobilis Team</p>`,
             };
             const ownerMailOptions = {
                 from: emailUser, to: emailRecipient, subject: `NEW ORDER #${session.id.slice(-8)} from ${customer.name || 'Customer'}`,
