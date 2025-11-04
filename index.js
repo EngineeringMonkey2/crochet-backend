@@ -95,10 +95,24 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
             const transporter = getTransporter();
             const formatLineItem = (item) => {
                 const metadata = item.price && item.price.product ? item.price.product.metadata : {};
+                let additionalInfo = '';
+                
+                // Handle custom details (for custom monkeys)
                 if (metadata.custom_details) {
                     const customDetails = JSON.parse(metadata.custom_details);
                     const customDetailsHtml = Object.entries(customDetails).map(([part, filename]) => `<li>${part}: ${filename}</li>`).join('');
-                    return `<li><b>Item:</b> ${item.description} <br><b>Quantity:</b> ${item.quantity} <br><b>Price:</b> $${(item.amount_total / 100).toFixed(2)} <br><b>Custom Details:</b><ul>${customDetailsHtml}</ul></li>`;
+                    additionalInfo += `<br><b>Custom Details:</b><ul>${customDetailsHtml}</ul>`;
+                }
+                
+                // Handle product options (like color selection)
+                if (metadata.product_options) {
+                    const productOptions = JSON.parse(metadata.product_options);
+                    const optionsHtml = Object.entries(productOptions).map(([key, value]) => `<span style="background-color: #f5f5f5; padding: 2px 6px; border-radius: 3px; margin-right: 5px;">${key}: ${value}</span>`).join('');
+                    additionalInfo += `<br><b>Options:</b> ${optionsHtml}`;
+                }
+                
+                if (additionalInfo) {
+                    return `<li><b>Item:</b> ${item.description} <br><b>Quantity:</b> ${item.quantity} <br><b>Price:</b> $${(item.amount_total / 100).toFixed(2)}${additionalInfo}</li>`;
                 } else {
                     return `<li>${item.quantity} x ${item.description} - $${(item.amount_total / 100).toFixed(2)}</li>`;
                 }
@@ -307,11 +321,19 @@ app.post('/create-checkout-session', async (req, res) => {
 
     const lineItems = cart.map(item => {
         const productData = { name: item.name, images: item.image ? [item.image] : undefined, metadata: { productId: item.id } };
+        
+        // Handle custom monkey details
         if (item.name === 'Custom Monkey' && item.images) {
             const shortImages = {};
             for (const part in item.images) { shortImages[part] = item.images[part].split('/').pop(); }
             productData.metadata.custom_details = JSON.stringify(shortImages);
         }
+        
+        // Handle product options (like color selection)
+        if (item.options && Object.keys(item.options).length > 0) {
+            productData.metadata.product_options = JSON.stringify(item.options);
+        }
+        
         return {
             price_data: {
 				currency: 'usd',
